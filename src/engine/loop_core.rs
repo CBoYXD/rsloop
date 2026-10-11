@@ -620,6 +620,35 @@ impl LoopCore {
         callback: Py<PyAny>,
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
+    ) -> PyResult<(Arc<ReadyCallback>, f64)> {
+        let (captured, context_needs_run) = capture_context(py, context)?;
+        let ready = Arc::new(ReadyCallback::new(
+            py,
+            self.next_callback_id(),
+            CallbackKind::Timer,
+            callback,
+            args,
+            captured,
+            context_needs_run,
+        ));
+        let timer = Arc::new(TimerCallback::from_shared(
+            Arc::clone(&ready),
+            Arc::clone(&self.cancelled_timers),
+        ));
+        let when = self.enqueue_timer(delay, timer)?;
+        Ok((ready, when))
+    }
+
+    /// Python timers own a detachable payload instead of the Rust API's
+    /// externally borrowable immutable Arc<ReadyCallback>.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
+    pub(crate) fn schedule_cancellable_timer(
+        self: &Arc<Self>,
+        py: Python<'_>,
+        delay: Duration,
+        callback: Py<PyAny>,
+        args: Py<PyTuple>,
+        context: Option<Py<PyAny>>,
     ) -> PyResult<(Arc<TimerCallback>, f64)> {
         let (captured, context_needs_run) = capture_context(py, context)?;
         let ready = Arc::new(TimerCallback::new(
@@ -635,14 +664,25 @@ impl LoopCore {
             Arc::clone(&self.cancelled_timers),
         ));
 
+        let when = self.enqueue_timer(delay, Arc::clone(&ready))?;
+        Ok((ready, when))
+    }
+
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
+    fn enqueue_timer(
+        self: &Arc<Self>,
+        delay: Duration,
+        ready: Arc<TimerCallback>,
+    ) -> PyResult<f64> {
         let deadline = Instant::now() + delay;
         // Derive the public timestamp from the actual heap deadline. This also
         // avoids reading the monotonic clock twice for every timer.
         let when = deadline.duration_since(self.start).as_secs_f64();
+        let seq = ready.id();
         let entry = TimerEntry {
-            callback: Arc::clone(&ready),
+            callback: ready,
             when: deadline,
-            seq: ready.id(),
+            seq,
         };
         let remote = ACTIVE_LOOP_TLS.with(|tls| {
             if std::ptr::eq(tls.core.get(), Arc::as_ptr(self)) && !tls.timers.get().is_null() {
@@ -669,7 +709,7 @@ impl LoopCore {
             drop(state);
             self.wake.signal();
         }
-        Ok((ready, when))
+        Ok(when)
     }
 
     /// Runs callbacks and I/O until [`LoopCore::schedule_stop`] is processed.
@@ -847,8 +887,9 @@ impl LoopCore {
                         }
                     }
                     ReadyItem::TimerCallback(timer) => {
-                        if let Some(callback) = timer.take_ready() {
-                            if let Some(err) = self.execute_ready(py, Some(&loop_obj), &callback)? {
+                        let owned = timer.take_ready();
+                        if let Some(callback) = owned.as_ref().or_else(|| timer.shared_ready()) {
+                            if let Some(err) = self.execute_ready(py, Some(&loop_obj), callback)? {
                                 ready_error = Some(err);
                                 break;
                             }
@@ -1783,6 +1824,63 @@ mod wake_tests {
     }
 
     #[test]
+    fn public_rust_timer_api_keeps_shared_ready_callback_and_handle_contract() {
+        crate::initialize_python_for_tests();
+        Python::attach(|py| {
+            let core = LoopCore::new();
+            let callback = py
+                .eval(pyo3::ffi::c_str!("lambda: 42"), None, None)
+                .expect("callable")
+                .unbind();
+            let (ready, when): (Arc<ReadyCallback>, f64) = core
+                .schedule_timer(
+                    py,
+                    Duration::ZERO,
+                    callback,
+                    PyTuple::empty(py).unbind(),
+                    None,
+                )
+                .expect("shared Rust timer");
+            let handle = Py::new(
+                py,
+                super::super::callbacks::PyTimerHandle::new(ready.id(), when, &ready),
+            )
+            .expect("public Rust handle constructor");
+            assert_eq!(
+                ready
+                    .invoke(py)
+                    .expect("invoke shared payload")
+                    .extract::<i32>(py)
+                    .expect("result"),
+                42
+            );
+            handle
+                .bind(py)
+                .call_method0("cancel")
+                .expect("cancel shared timer");
+            assert!(ready.cancelled());
+            let mut local = LocalTimers::new(&core);
+            let mut batch = VecDeque::new();
+            local.collect(&mut batch);
+            let ReadyItem::TimerCallback(timer) = batch.pop_front().expect("timer") else {
+                panic!("expected timer callback");
+            };
+            assert!(timer.cancelled());
+            assert!(timer.take_ready().is_none());
+            let shared = timer.shared_ready().expect("legacy shared ownership");
+            assert!(std::ptr::eq(shared, ready.as_ref()));
+            assert!(
+                core.execute_ready(py, None, shared)
+                    .expect("skip cancelled")
+                    .is_none()
+            );
+            assert_eq!(core.cancelled_timers.load(Ordering::Relaxed), 0);
+            drop(local);
+            core.close().expect("close loop");
+        });
+    }
+
+    #[test]
     fn cancelled_timer_burst_is_compacted_behind_an_earlier_live_timer() {
         crate::initialize_python_for_tests();
         Python::attach(|py| {
@@ -1797,7 +1895,7 @@ mod wake_tests {
             .expect("sentinel");
             for _ in 0..256 {
                 let (callback, _) = core
-                    .schedule_timer(
+                    .schedule_cancellable_timer(
                         py,
                         Duration::from_secs(3600),
                         py.None(),
