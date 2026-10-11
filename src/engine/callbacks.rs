@@ -348,6 +348,10 @@ pub struct TimerCallback {
     state: Mutex<TimerState>,
     cancelled: AtomicBool,
     cancelled_timers: Arc<AtomicUsize>,
+    // The public Rust API historically returns an immutable Arc<ReadyCallback>.
+    // Preserve that explicit shared ownership for Rust embedders; Python timers
+    // use the detachable payload above instead.
+    legacy: Option<Arc<ReadyCallback>>,
 }
 
 struct TimerState {
@@ -366,7 +370,30 @@ impl TimerCallback {
             }),
             cancelled: AtomicBool::new(false),
             cancelled_timers,
+            legacy: None,
         }
+    }
+
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
+    pub(super) fn from_shared(
+        ready: Arc<ReadyCallback>,
+        cancelled_timers: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            id: ready.id(),
+            state: Mutex::new(TimerState {
+                ready: None,
+                queued: true,
+            }),
+            cancelled: AtomicBool::new(false),
+            cancelled_timers,
+            legacy: Some(ready),
+        }
+    }
+
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
+    pub(super) fn shared_ready(&self) -> Option<&ReadyCallback> {
+        self.legacy.as_deref()
     }
 
     #[inline]
@@ -379,6 +406,7 @@ impl TimerCallback {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
     pub fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+            || self.legacy.as_ref().is_some_and(|ready| ready.cancelled())
     }
 
     /// Linearize cancellation and detach Python ownership under the same lock
@@ -398,6 +426,9 @@ impl TimerCallback {
             state.ready.take()
         };
         drop(ready);
+        if let Some(ready) = &self.legacy {
+            ready.cancel();
+        }
     }
 
     /// Queue removal and cancellation share the lock so repeated cancellation,
@@ -405,7 +436,7 @@ impl TimerCallback {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
     pub(super) fn dequeue(&self) {
         let mut state = self.state.lock().expect("poisoned timer state");
-        if state.queued && self.cancelled() {
+        if state.queued && self.cancelled.load(Ordering::Relaxed) {
             self.cancelled_timers.fetch_sub(1, Ordering::Relaxed);
         }
         state.queued = false;
@@ -452,19 +483,38 @@ impl Drop for TimerCallback {
 pub struct PyTimerHandle {
     callback_id: CallbackId,
     when: f64,
-    callback: Weak<TimerCallback>,
+    callback: TimerHandleCallback,
     cancelled: AtomicBool,
+}
+
+enum TimerHandleCallback {
+    Owned(Weak<TimerCallback>),
+    Shared(Weak<ReadyCallback>),
 }
 
 impl PyTimerHandle {
     #[inline]
     /// Creates a timer handle for a callback scheduled at loop time `when`.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PyTimerHandle"))]
-    pub fn new(callback_id: CallbackId, when: f64, callback: &Arc<TimerCallback>) -> Self {
+    pub fn new(callback_id: CallbackId, when: f64, callback: &Arc<ReadyCallback>) -> Self {
         Self {
             callback_id,
             when,
-            callback: Arc::downgrade(callback),
+            callback: TimerHandleCallback::Shared(Arc::downgrade(callback)),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PyTimerHandle"))]
+    pub(crate) fn new_timer(
+        callback_id: CallbackId,
+        when: f64,
+        callback: &Arc<TimerCallback>,
+    ) -> Self {
+        Self {
+            callback_id,
+            when,
+            callback: TimerHandleCallback::Owned(Arc::downgrade(callback)),
             cancelled: AtomicBool::new(false),
         }
     }
@@ -701,7 +751,7 @@ mod tests {
                 callback_with_args(py, 12, PyTuple::empty(py).unbind()),
                 Arc::new(AtomicUsize::new(0)),
             ));
-            let timer = PyTimerHandle::new(12, 1.25, &ready);
+            let timer = PyTimerHandle::new_timer(12, 1.25, &ready);
             assert!((timer.when() - 1.25).abs() < f64::EPSILON);
             assert!(!timer.cancelled());
 
@@ -717,7 +767,7 @@ mod tests {
                 callback_with_args(py, 13, PyTuple::empty(py).unbind()),
                 Arc::new(AtomicUsize::new(0)),
             ));
-            let dropped_timer = PyTimerHandle::new(13, 2.0, &dropped);
+            let dropped_timer = PyTimerHandle::new_timer(13, 2.0, &dropped);
             drop(dropped);
             dropped_timer
                 .cancel()
@@ -732,8 +782,17 @@ impl PyTimerHandle {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PyTimerHandle"))]
     fn cancel(&self) -> PyResult<()> {
         self.cancelled.store(true, Ordering::Relaxed);
-        if let Some(callback) = self.callback.upgrade() {
-            callback.cancel();
+        match &self.callback {
+            TimerHandleCallback::Owned(callback) => {
+                if let Some(callback) = callback.upgrade() {
+                    callback.cancel();
+                }
+            }
+            TimerHandleCallback::Shared(callback) => {
+                if let Some(callback) = callback.upgrade() {
+                    callback.cancel();
+                }
+            }
         }
         Ok(())
     }

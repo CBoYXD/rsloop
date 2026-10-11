@@ -102,7 +102,7 @@ impl PyLoop {
             return Err(PyValueError::new_err("delay cannot be NaN"));
         }
         let delay = delay.clamp(0.0, MAX_TIMER_DELAY_SECS);
-        let (ready, when) = self.core.schedule_timer(
+        let (ready, when) = self.core.schedule_cancellable_timer(
             py,
             Duration::from_secs_f64(delay),
             callback,
@@ -110,7 +110,7 @@ impl PyLoop {
             context,
         )?;
 
-        Py::new(py, PyTimerHandle::new(ready.id(), when, &ready))
+        Py::new(py, PyTimerHandle::new_timer(ready.id(), when, &ready))
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PyLoop"))]
