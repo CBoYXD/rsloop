@@ -12,7 +12,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     task::{Context, Poll, Waker},
@@ -30,7 +30,7 @@ use pyo3::{
 #[cfg(unix)]
 use super::commands::{ConnectCompletion, TcpReaderStart};
 use super::{
-    callbacks::{CallbackArgs, CallbackId, CallbackKind, ReadyCallback},
+    callbacks::{CallbackArgs, CallbackId, CallbackKind, ReadyCallback, TimerCallback},
     commands::{
         AcceptedConnection, FutureCompletion, LoopCommand, LoopFutureCommand, LoopIoCommand,
         LoopRunCommand, LoopTransportCommand, ReadyItem,
@@ -232,6 +232,14 @@ impl<'a> LocalTimers<'a> {
                     .expect("poisoned pending timers"),
             );
         }
+        // Like asyncio, amortize linear heap rebuilding over large bursts.
+        // Small queues retain at most 100 tombstones; larger queues compact
+        // once more than half of their entries are cancelled. These relaxed
+        // atomics are statistical hints; per-timer ownership uses a mutex.
+        let cancelled = self.core.cancelled_timers.load(Ordering::Relaxed);
+        if cancelled > 100 && cancelled > self.heap.len() / 2 {
+            self.heap.compact_cancelled(ready);
+        }
         let now = Instant::now();
         while self
             .heap
@@ -241,7 +249,8 @@ impl<'a> LocalTimers<'a> {
             let entry = self.heap.pop().expect("timer heap was nonempty");
             // Even cancelled callbacks are released by the ready drain, never
             // while the heap is mutably borrowed: finalizers can schedule work.
-            ready.push_back(ReadyItem::Callback(entry.callback));
+            entry.callback.dequeue();
+            ready.push_back(ReadyItem::TimerCallback(entry.callback));
         }
     }
 
@@ -382,6 +391,7 @@ pub struct LoopCore {
     active_ready_dispatch: Mutex<Option<ActiveReadyDispatch>>,
     pending_timers: Mutex<BinaryHeap<TimerEntry>>,
     pending_timers_dirty: AtomicBool,
+    cancelled_timers: Arc<AtomicUsize>,
     // Wakes the loop thread when a producer enqueues a ready item. Held in an
     // Arc so the park future (`WaitForWake`) can own a clone under `py.detach`.
     wake: Arc<LoopWake>,
@@ -414,6 +424,7 @@ impl LoopCore {
             active_ready_dispatch: Mutex::new(None),
             pending_timers: Mutex::new(BinaryHeap::new()),
             pending_timers_dirty: AtomicBool::new(false),
+            cancelled_timers: Arc::new(AtomicUsize::new(0)),
             wake: Arc::new(LoopWake::new()),
         });
 
@@ -609,16 +620,19 @@ impl LoopCore {
         callback: Py<PyAny>,
         args: Py<PyTuple>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<(Arc<ReadyCallback>, f64)> {
+    ) -> PyResult<(Arc<TimerCallback>, f64)> {
         let (captured, context_needs_run) = capture_context(py, context)?;
-        let ready = Arc::new(ReadyCallback::new(
-            py,
-            self.next_callback_id(),
-            CallbackKind::Timer,
-            callback,
-            args,
-            captured,
-            context_needs_run,
+        let ready = Arc::new(TimerCallback::new(
+            ReadyCallback::new(
+                py,
+                self.next_callback_id(),
+                CallbackKind::Timer,
+                callback,
+                args,
+                captured,
+                context_needs_run,
+            ),
+            Arc::clone(&self.cancelled_timers),
         ));
 
         let deadline = Instant::now() + delay;
@@ -830,6 +844,14 @@ impl LoopCore {
                         {
                             ready_error = Some(err);
                             break;
+                        }
+                    }
+                    ReadyItem::TimerCallback(timer) => {
+                        if let Some(callback) = timer.take_ready() {
+                            if let Some(err) = self.execute_ready(py, Some(&loop_obj), &callback)? {
+                                ready_error = Some(err);
+                                break;
+                            }
                         }
                     }
                     ReadyItem::FutureSetResult(payload) => {
@@ -1503,6 +1525,9 @@ impl LoopCore {
                 .try_enqueue_local_ready(ReadyItem::Callback(callback))
                 .or_else(|item| self.try_enqueue_active_ready(item))
                 .map_err(|item| match item {
+                    ReadyItem::TimerCallback(_) => {
+                        unreachable!("ordinary enqueue cannot produce timers")
+                    }
                     ReadyItem::Callback(callback) => LoopCommand::ScheduleReady(callback),
                     ReadyItem::HandleCallback(handle) => LoopCommand::ScheduleReadyHandle(handle),
                     ReadyItem::Stop => LoopCommand::RequestStop,
@@ -1753,6 +1778,49 @@ mod wake_tests {
                 assert_eq!(entry.seq, ready.id());
                 assert_eq!(when, entry.when.duration_since(core.start).as_secs_f64());
             }
+            core.close().expect("close loop");
+        });
+    }
+
+    #[test]
+    fn cancelled_timer_burst_is_compacted_behind_an_earlier_live_timer() {
+        crate::initialize_python_for_tests();
+        Python::attach(|py| {
+            let core = LoopCore::new();
+            core.schedule_timer(
+                py,
+                Duration::from_secs(1800),
+                py.None(),
+                PyTuple::empty(py).unbind(),
+                None,
+            )
+            .expect("sentinel");
+            for _ in 0..256 {
+                let (callback, _) = core
+                    .schedule_timer(
+                        py,
+                        Duration::from_secs(3600),
+                        py.None(),
+                        PyTuple::empty(py).unbind(),
+                        None,
+                    )
+                    .expect("timer");
+                callback.cancel();
+                callback.cancel();
+            }
+            let mut local = LocalTimers::new(&core);
+            let mut ready = VecDeque::new();
+            local.collect(&mut ready);
+            let mut remaining = BinaryHeap::new();
+            local.heap.drain_into(&mut remaining);
+            assert_eq!(
+                remaining.len(),
+                1,
+                "cancelled shells retained behind sentinel"
+            );
+            drop(local);
+            drop(remaining);
+            drop(ready);
             core.close().expect("close loop");
         });
     }
