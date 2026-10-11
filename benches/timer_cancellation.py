@@ -127,11 +127,13 @@ async def postgres_case(count):
         )
         try:
             for index in range(3):
-                async with asyncio.timeout(3600):
-                    assert (
-                        await conn.fetchval(f"SELECT $1::int + {index}", index)
-                        == 2 * index
-                    )
+                query = conn.fetchval(f"SELECT $1::int + {index}", index)
+                if hasattr(asyncio, "timeout"):
+                    async with asyncio.timeout(3600):
+                        value = await query
+                else:
+                    value = await asyncio.wait_for(query, 3600)
+                assert value == 2 * index
         finally:
             await conn.close()
 
