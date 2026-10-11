@@ -38,6 +38,9 @@ struct RuntimeDispatcher {
     core: Arc<LoopCore>,
     command_rx: Receiver<LoopCommand>,
     ready_batch: VecDeque<ReadyItem>,
+    /// Channel handles in `ready_batch`, released from
+    /// `LoopCore::channel_handles` once they reach an active run.
+    channel_handles: usize,
     active_run: Option<ActiveRun>,
     #[cfg(unix)]
     signal_tasks: HashMap<i32, SignalWatcher>,
@@ -126,6 +129,7 @@ pub fn run_runtime_thread(core: Arc<LoopCore>, command_rx: Receiver<LoopCommand>
         core: Arc::clone(&core),
         command_rx,
         ready_batch: VecDeque::new(),
+        channel_handles: 0,
         active_run: None,
         #[cfg(unix)]
         signal_tasks: HashMap::new(),
@@ -204,6 +208,7 @@ impl RuntimeDispatcher {
                 self.ready_batch.push_back(ReadyItem::Callback(callback));
             }
             LoopCommand::ScheduleReadyHandle(handle) => {
+                self.channel_handles += 1;
                 self.ready_batch
                     .push_back(ReadyItem::HandleCallback(handle));
             }
@@ -495,6 +500,8 @@ impl RuntimeDispatcher {
             .expect("poisoned pending ready queue");
         pending.extend(self.ready_batch.drain(..));
         drop(pending);
+        self.core
+            .channel_handles_forwarded(std::mem::take(&mut self.channel_handles));
         // Wake the parked loop thread so runtime-dispatched work (fd
         // watchers) is observed; `signal_ready` coalesces redundant wakes.
         self.core.signal_ready();
@@ -506,8 +513,12 @@ impl RuntimeDispatcher {
             return;
         };
 
+        // The run's queue holds older work (its unexecuted callbacks, then
+        // direct off-thread handles) than commands received since the last
+        // dispatch, so it goes first.
         if let Ok(mut pending) = active_run.pending_ready.lock() {
-            self.ready_batch.extend(pending.drain(..));
+            pending.extend(self.ready_batch.drain(..));
+            std::mem::swap(&mut self.ready_batch, &mut *pending);
         }
 
         {

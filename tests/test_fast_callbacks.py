@@ -5,6 +5,7 @@ import contextvars
 import gc
 import sys
 import threading
+import time
 import weakref
 from typing import Any, cast
 
@@ -210,6 +211,37 @@ class TestFastCallback:
             loop.run_forever()
             thread.join()
             assert events == list(range(1000))
+        finally:
+            thread.join()
+            loop.close()
+
+    def test_threadsafe_producer_order_survives_run_restarts(self):
+        # A producer that keeps posting while runs stop and restart sends some
+        # callbacks through the dispatcher (between runs) and some straight to
+        # the active run; neither path may overtake the other.
+        loop = rsloop.new_event_loop()
+        events = []
+        total = 20000
+
+        def record(value):
+            events.append(value)
+            if len(events) % 97 == 0:
+                loop.stop()
+
+        def producer():
+            for value in range(total):
+                loop.call_soon_threadsafe(record, value)
+                if value % 64 == 0:
+                    time.sleep(0)  # let runs start and stop while posting
+            loop.call_soon_threadsafe(loop.stop)
+
+        thread = threading.Thread(target=producer)
+        try:
+            thread.start()
+            while len(events) < total:
+                loop.run_forever()
+            thread.join()
+            assert events == list(range(total))
         finally:
             thread.join()
             loop.close()
