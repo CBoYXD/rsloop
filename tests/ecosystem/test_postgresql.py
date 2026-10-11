@@ -1,6 +1,7 @@
 """Real PostgreSQL contracts; opt in with a dedicated RSLOOP_POSTGRES_DSN."""
 
 import asyncio
+import gc
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -255,3 +256,47 @@ def test_postgres_tcp_disconnect_and_pool_recovery(loop, postgres_dsn, driver):
             await observer.close()
 
     loop.run_until_complete(asyncio.wait_for(main(), 20))
+
+
+def test_closed_connections_release_statement_cache_before_expiry(loop, postgres_dsn):
+    """A live earlier timer must not pin cache expiry callbacks after close (#118)."""
+    names = {"_StatementCache", "PreparedStatementState", "Protocol"}
+
+    def counts():
+        gc.collect()
+        result = dict.fromkeys(names, 0)
+        for obj in gc.get_objects():
+            name = type(obj).__name__
+            if name in result:
+                result[name] += 1
+        return result
+
+    async def main():
+        sentinel = loop.call_later(1800, lambda: None)
+        before = counts()
+
+        async def connection():
+            conn = await asyncpg.connect(
+                postgres_dsn, max_cached_statement_lifetime=3600
+            )
+            try:
+                for index in range(3):
+                    assert (
+                        await conn.fetchval(f"SELECT $1::int + {index}", index)
+                        == 2 * index
+                    )
+            finally:
+                await conn.close()
+
+        try:
+            for _ in range(5):
+                await asyncio.gather(*(connection() for _ in range(10)))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            after = counts()
+            delta = {name: after[name] - before[name] for name in names}
+            assert all(value <= 0 for value in delta.values()), delta
+        finally:
+            sentinel.cancel()
+
+    loop.run_until_complete(asyncio.wait_for(main(), 30))

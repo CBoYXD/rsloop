@@ -112,5 +112,12 @@ jobs:
         run: |
           uv run --no-sync python -c "import asyncpg, sqlalchemy, uvloop, platform; from importlib.metadata import version; print(platform.platform(), platform.python_version()); print({p: version(p) for p in ('asyncpg', 'sqlalchemy', 'uvloop')})"
           docker exec ${{ job.services.postgres.id }} postgres --version
+      - name: Measure cancelled timers and closed statement caches
+        run: |
+          for event_loop in asyncio uvloop rsloop; do
+            uv run --no-sync python benches/timer_cancellation.py --loop "$event_loop" --case timers
+            uv run --no-sync python benches/timer_cancellation.py --loop "$event_loop" --case timeout
+            uv run --no-sync python benches/timer_cancellation.py --loop "$event_loop" --case postgres --count 500
+          done
       - name: Compare PostgreSQL lifecycles
         run: uv run --no-sync python scripts/run_python_tests.py tests/ecosystem/test_postgresql.py -m ecosystem -ra
