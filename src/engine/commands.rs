@@ -7,7 +7,7 @@ use std::{
 
 use pyo3::prelude::*;
 
-use super::callbacks::{PyHandle, ReadyCallback};
+use super::callbacks::{PyHandle, ReadyCallback, TimerCallback};
 use crate::{
     fd_ops::RawFd,
     transport::{
@@ -23,6 +23,7 @@ use crate::{
 /// GIL.
 pub enum ReadyItem {
     Callback(Arc<ReadyCallback>),
+    TimerCallback(Arc<TimerCallback>),
     HandleCallback(Py<PyHandle>),
     FutureSetResult(Box<FutureCompletion>),
     FutureSetException(Box<FutureCompletion>),

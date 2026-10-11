@@ -1,8 +1,8 @@
 //! Callback values and Python handle wrappers used by the loop engine.
 
 use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, Weak,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use pyo3::{prelude::*, types::PyTuple};
@@ -341,6 +341,103 @@ impl PyHandle {
     }
 }
 
+/// Mutable ownership exists only for timers: ordinary ready callbacks keep
+/// their allocation size and lock-free invocation path.
+pub struct TimerCallback {
+    id: CallbackId,
+    state: Mutex<TimerState>,
+    cancelled: AtomicBool,
+    cancelled_timers: Arc<AtomicUsize>,
+}
+
+struct TimerState {
+    ready: Option<ReadyCallback>,
+    queued: bool,
+}
+
+impl TimerCallback {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
+    pub fn new(ready: ReadyCallback, cancelled_timers: Arc<AtomicUsize>) -> Self {
+        Self {
+            id: ready.id(),
+            state: Mutex::new(TimerState {
+                ready: Some(ready),
+                queued: true,
+            }),
+            cancelled: AtomicBool::new(false),
+            cancelled_timers,
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
+    pub fn id(&self) -> CallbackId {
+        self.id
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
+    pub fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Linearize cancellation and detach Python ownership under the same lock
+    /// as invocation. Drop outside it: DECREF can run reentrant finalizers.
+    /// The Python handle calls this while attached; Rust callers can also use
+    /// PyO3's deferred decref when detached.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
+    pub fn cancel(&self) {
+        let ready = {
+            let mut state = self.state.lock().expect("poisoned timer state");
+            if self.cancelled.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            if state.queued {
+                self.cancelled_timers.fetch_add(1, Ordering::Relaxed);
+            }
+            state.ready.take()
+        };
+        drop(ready);
+    }
+
+    /// Queue removal and cancellation share the lock so repeated cancellation,
+    /// cross-thread removal and loop shutdown count each tombstone once.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
+    pub(super) fn dequeue(&self) {
+        let mut state = self.state.lock().expect("poisoned timer state");
+        if state.queued && self.cancelled() {
+            self.cancelled_timers.fetch_sub(1, Ordering::Relaxed);
+        }
+        state.queued = false;
+    }
+
+    /// The invocation owns its payload until completion. A concurrent cancel
+    /// can prevent a not-yet-claimed invocation, but cannot invalidate a
+    /// running callback's arguments/context. No lock crosses Python
+    /// execution.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerCallback"))]
+    pub(super) fn take_ready(&self) -> Option<ReadyCallback> {
+        self.state
+            .lock()
+            .expect("poisoned timer state")
+            .ready
+            .take()
+    }
+}
+
+impl Drop for TimerCallback {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<TimerCallback as Drop>")
+    )]
+    fn drop(&mut self) {
+        let state = self.state.get_mut().expect("poisoned timer state");
+        if state.queued && *self.cancelled.get_mut() {
+            self.cancelled_timers.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Python's cancellable `asyncio.TimerHandle` equivalent.
 ///
 /// The weak callback reference lets cancellation update a live scheduled
@@ -355,7 +452,7 @@ impl PyHandle {
 pub struct PyTimerHandle {
     callback_id: CallbackId,
     when: f64,
-    callback: Weak<ReadyCallback>,
+    callback: Weak<TimerCallback>,
     cancelled: AtomicBool,
 }
 
@@ -363,7 +460,7 @@ impl PyTimerHandle {
     #[inline]
     /// Creates a timer handle for a callback scheduled at loop time `when`.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PyTimerHandle"))]
-    pub fn new(callback_id: CallbackId, when: f64, callback: &Arc<ReadyCallback>) -> Self {
+    pub fn new(callback_id: CallbackId, when: f64, callback: &Arc<TimerCallback>) -> Self {
         Self {
             callback_id,
             when,
@@ -519,10 +616,91 @@ mod tests {
     }
 
     #[test]
+    fn timer_cancellation_racing_queue_removal_counts_once() {
+        crate::initialize_python_for_tests();
+        Python::attach(|py| {
+            let count = Arc::new(AtomicUsize::new(0));
+            for id in 0..128 {
+                let timer = TimerCallback::new(
+                    callback_with_args(py, id, PyTuple::empty(py).unbind()),
+                    Arc::clone(&count),
+                );
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        timer.cancel();
+                        timer.cancel();
+                    });
+                    scope.spawn(|| {
+                        timer.dequeue();
+                        timer.dequeue();
+                    });
+                });
+                assert!(timer.cancelled());
+                assert!(timer.take_ready().is_none());
+                assert_eq!(count.load(Ordering::Relaxed), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn timer_claim_racing_cancel_never_invokes_twice_or_loses_ownership() {
+        crate::initialize_python_for_tests();
+        Python::attach(|py| {
+            for id in 0..128 {
+                let count = Arc::new(AtomicUsize::new(0));
+                let timer = TimerCallback::new(
+                    callback_with_args(py, id, PyTuple::empty(py).unbind()),
+                    Arc::clone(&count),
+                );
+                timer.dequeue();
+                let claimed = std::thread::scope(|scope| {
+                    scope.spawn(|| timer.cancel());
+                    scope
+                        .spawn(|| timer.take_ready())
+                        .join()
+                        .expect("claim thread")
+                });
+                if let Some(callback) = claimed {
+                    assert_eq!(
+                        callback
+                            .invoke(py)
+                            .expect("claimed invocation")
+                            .extract::<Vec<i32>>(py)
+                            .expect("result"),
+                        Vec::<i32>::new()
+                    );
+                }
+                assert!(timer.take_ready().is_none());
+                assert_eq!(count.load(Ordering::Relaxed), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn dropping_queued_cancelled_timer_restores_count() {
+        crate::initialize_python_for_tests();
+        Python::attach(|py| {
+            let count = Arc::new(AtomicUsize::new(0));
+            let timer = TimerCallback::new(
+                callback_with_args(py, 1, PyTuple::empty(py).unbind()),
+                Arc::clone(&count),
+            );
+            timer.cancel();
+            timer.cancel();
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+            drop(timer);
+            assert_eq!(count.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
     fn timer_handle_cancels_live_callback_and_tolerates_a_dropped_one() {
         crate::initialize_python_for_tests();
         Python::attach(|py| {
-            let ready = Arc::new(callback_with_args(py, 12, PyTuple::empty(py).unbind()));
+            let ready = Arc::new(TimerCallback::new(
+                callback_with_args(py, 12, PyTuple::empty(py).unbind()),
+                Arc::new(AtomicUsize::new(0)),
+            ));
             let timer = PyTimerHandle::new(12, 1.25, &ready);
             assert!((timer.when() - 1.25).abs() < f64::EPSILON);
             assert!(!timer.cancelled());
@@ -535,7 +713,10 @@ mod tests {
                 "<TimerHandle id=12 when=1.250000 cancelled=true>"
             );
 
-            let dropped = Arc::new(callback_with_args(py, 13, PyTuple::empty(py).unbind()));
+            let dropped = Arc::new(TimerCallback::new(
+                callback_with_args(py, 13, PyTuple::empty(py).unbind()),
+                Arc::new(AtomicUsize::new(0)),
+            ));
             let dropped_timer = PyTimerHandle::new(13, 2.0, &dropped);
             drop(dropped);
             dropped_timer

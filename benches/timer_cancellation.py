@@ -157,6 +157,7 @@ async def postgres_case(count):
 
 async def performance_case(count):
     # Reuse the repository's workloads, without tracemalloc or GC in timed spans.
+    from compare_event_loops import bench_callbacks
     from scheduler_workloads import bench_timers
 
     samples = {}
@@ -170,6 +171,10 @@ async def performance_case(count):
         samples[mode] = [
             (await bench_timers("probe", count, 1000, mode)).seconds for _ in range(7)
         ]
+    await bench_callbacks("probe", 1000)
+    samples["call_soon"] = [
+        (await bench_callbacks("probe", count)).seconds for _ in range(7)
+    ]
     return {
         "count": count,
         "samples_seconds": samples,
@@ -191,6 +196,17 @@ def main():
     )
     parser.add_argument("--count", type=int, default=20000)
     args = parser.parse_args()
+    if args.case == "timeout" and not hasattr(asyncio, "timeout"):
+        print(
+            json.dumps(
+                {
+                    "loop": args.loop,
+                    "case": args.case,
+                    "skipped": "asyncio.timeout requires Python 3.11",
+                }
+            )
+        )
+        return
     if args.count <= 0:
         parser.error("--count must be positive")
     if args.loop == "asyncio":

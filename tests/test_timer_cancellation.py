@@ -150,7 +150,8 @@ def test_completed_timeout_tasks_and_results_are_released(loop, mode):
     loop.run_until_complete(main())
 
 
-def test_cancel_finalizers_can_reenter_and_close_loop(loop):
+@pytest.mark.parametrize("ownership", ["callback", "args", "context"])
+def test_cancel_finalizers_can_reenter_and_close_loop(loop, ownership):
     if not isinstance(loop, rsloop.Loop):
         pytest.skip("reentrant close is a separate rsloop lifecycle contract")
     events = []
@@ -167,7 +168,16 @@ def test_cancel_finalizers_can_reenter_and_close_loop(loop):
                 loop.call_later(0, lambda: None).cancel()
                 loop.close()
 
-    handles.append(loop.call_later(3600, Callback()))
+    if ownership == "callback":
+        handles.append(loop.call_later(3600, Callback()))
+    elif ownership == "args":
+        handles.append(loop.call_later(3600, lambda arg: None, Callback()))
+    else:
+        var = contextvars.ContextVar("finalizer_payload")
+        context = contextvars.Context()
+        context.run(var.set, Callback())
+        handles.append(loop.call_later(3600, lambda: None, context=context))
+        del context
     handles[0].cancel()
     released_immediately = events == ["released"]
     if not released_immediately:
@@ -244,3 +254,58 @@ def test_cancel_running_callback_preserves_arguments_and_context(loop):
         cancelled.set()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("mode", ["timeout", "wait_for"])
+def test_expired_timeout_still_cancels_awaited_work(loop, mode):
+    if mode == "timeout" and not hasattr(asyncio, "timeout"):
+        pytest.skip("asyncio.timeout requires Python 3.11")
+
+    async def main():
+        finalized = []
+
+        async def work():
+            try:
+                await asyncio.Future()
+            finally:
+                finalized.append("cancelled")
+
+        with pytest.raises(asyncio.TimeoutError):
+            if mode == "timeout":
+                async with asyncio.timeout(0.01):
+                    await work()
+            else:
+                await asyncio.wait_for(work(), 0.01)
+        assert finalized == ["cancelled"]
+        assert len(asyncio.all_tasks()) == 1
+
+    loop.run_until_complete(main())
+
+
+def test_periodic_timers_do_not_retain_cancelled_payloads(loop):
+    async def main():
+        started = [asyncio.Event(), asyncio.Event()]
+
+        async def heartbeat(index):
+            started[index].set()
+            while True:
+                await asyncio.sleep(0.01)
+
+        beats = [loop.create_task(heartbeat(index)) for index in range(2)]
+        try:
+            await asyncio.gather(*(event.wait() for event in started))
+            references = []
+            for _ in range(100):
+                handle, reference = make_timer(loop, "callback")
+                handle.cancel()
+                references.append(reference)
+            for _ in range(3):
+                await asyncio.sleep(0.01)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+        finally:
+            for beat in beats:
+                beat.cancel()
+            await asyncio.gather(*beats, return_exceptions=True)
+
+    loop.run_until_complete(main())

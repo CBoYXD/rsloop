@@ -24,7 +24,7 @@ fn compare_timer_parts<T: Ord>(
 pub(super) struct TimerEntry {
     pub(super) when: Instant,
     pub(super) seq: u64,
-    pub(super) callback: Arc<super::callbacks::ReadyCallback>,
+    pub(super) callback: Arc<super::callbacks::TimerCallback>,
 }
 
 /// Immediately due timers normally arrive in deadline order and use a FIFO.
@@ -46,6 +46,30 @@ impl TimerQueue {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerQueue"))]
     pub(super) fn is_empty(&self) -> bool {
         self.ordered.is_empty() && self.unordered.is_empty()
+    }
+
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerQueue"))]
+    pub(super) fn len(&self) -> usize {
+        self.ordered.len() + self.unordered.len()
+    }
+
+    /// Retain live entries in linear time, rebuilding the heap only after a
+    /// cancellation burst. Transfer removed shells to the ready drain rather
+    /// than dropping shared callback ownership under a queue borrow.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerQueue"))]
+    pub(super) fn compact_cancelled(&mut self, ready: &mut VecDeque<super::commands::ReadyItem>) {
+        let mut retain = |entry: &TimerEntry| {
+            if !entry.callback.cancelled() {
+                return true;
+            }
+            entry.callback.dequeue();
+            ready.push_back(super::commands::ReadyItem::TimerCallback(Arc::clone(
+                &entry.callback,
+            )));
+            false
+        };
+        self.ordered.retain(&mut retain);
+        self.unordered.retain(retain);
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TimerQueue"))]
@@ -203,20 +227,23 @@ mod tests {
     use pyo3::{prelude::*, types::PyTuple};
 
     use super::{TimerEntry, TimerQueue};
-    use crate::engine::callbacks::{CallbackKind, ReadyCallback};
+    use crate::engine::callbacks::{CallbackKind, ReadyCallback, TimerCallback};
 
     fn timer_entry(py: Python<'_>, when: Instant, seq: u64) -> TimerEntry {
         TimerEntry {
             when,
             seq,
-            callback: Arc::new(ReadyCallback::new(
-                py,
-                seq,
-                CallbackKind::Timer,
-                py.None(),
-                PyTuple::empty(py).unbind(),
-                py.None(),
-                false,
+            callback: Arc::new(TimerCallback::new(
+                ReadyCallback::new(
+                    py,
+                    seq,
+                    CallbackKind::Timer,
+                    py.None(),
+                    PyTuple::empty(py).unbind(),
+                    py.None(),
+                    false,
+                ),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             )),
         }
     }
@@ -243,6 +270,40 @@ mod tests {
             assert_eq!(popped.when, now + Duration::from_millis(20));
             assert_eq!(popped.seq, 0);
             assert!(heap.is_empty());
+        });
+    }
+
+    #[test]
+    fn compaction_preserves_live_deadlines_and_ties_in_both_queues() {
+        crate::initialize_python_for_tests();
+        Python::attach(|py| {
+            let now = Instant::now();
+            let mut queue = TimerQueue::new();
+            // FIFO prefix plus scattered heap arrivals, with equal deadlines.
+            for (seq, delay, immediate, cancelled) in [
+                (0, 0, true, false),
+                (1, 0, true, true),
+                (2, 0, true, false),
+                (3, 30, false, true),
+                (4, 10, false, false),
+                (5, 10, false, false),
+                (6, 20, false, true),
+            ] {
+                let entry = timer_entry(py, now + Duration::from_millis(delay), seq);
+                if cancelled {
+                    entry.callback.cancel();
+                }
+                queue.push(entry, immediate);
+            }
+            let mut removed = std::collections::VecDeque::new();
+            queue.compact_cancelled(&mut removed);
+            assert_eq!(removed.len(), 3);
+            assert_eq!(queue.len(), 4);
+            let mut live = Vec::new();
+            while let Some(entry) = queue.pop() {
+                live.push(entry.seq);
+            }
+            assert_eq!(live, [0, 2, 4, 5]);
         });
     }
 
