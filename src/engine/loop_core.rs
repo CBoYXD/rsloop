@@ -185,7 +185,6 @@ impl Future for WaitForWake {
     }
 }
 
-const READY_DRAIN_SLICE: usize = 64;
 const MAX_READY_ITEMS_PER_TURN: usize = 1024;
 const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RUN_FINISH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -404,6 +403,10 @@ pub struct LoopCore {
     /// handle may join the active queue directly without overtaking an
     /// earlier handle from the same producer.
     channel_handles: AtomicUsize,
+    /// A `stop()` whose queued Stop item has not run yet. Until it runs, the
+    /// ready drain keeps taking newly queued work into the current turn, so a
+    /// stop takes effect at the end of the turn that requested it.
+    stop_requested: AtomicBool,
     // Wakes the loop thread when a producer enqueues a ready item. Held in an
     // Arc so the park future (`WaitForWake`) can own a clone under `py.detach`.
     wake: Arc<LoopWake>,
@@ -438,6 +441,7 @@ impl LoopCore {
             pending_timers_dirty: AtomicBool::new(false),
             cancelled_timers: Arc::new(AtomicUsize::new(0)),
             channel_handles: AtomicUsize::new(0),
+            stop_requested: AtomicBool::new(false),
             wake: Arc::new(LoopWake::new()),
         });
 
@@ -832,48 +836,33 @@ impl LoopCore {
 
             let mut ready_error = None;
             let mut deferred_fd_rearms = Vec::new();
-            let mut processed_since_refill = 0_usize;
             let mut processed_this_turn = 0_usize;
             loop {
-                if ready_batch.is_empty() || processed_since_refill >= READY_DRAIN_SLICE {
+                if ready_batch.is_empty() {
+                    // One generation per turn, as in asyncio's `_run_once`:
+                    // callbacks scheduled while this batch runs wait for the
+                    // next turn, after the reactor has been polled again.
+                    // Running each turn to quiescence instead let completions
+                    // pile up between polls, then land in one burst: behind a
+                    // SQLAlchemy pool, more connections came back in one turn
+                    // than its idle queue holds before any woken waiter ran,
+                    // and the overflow was closed and reopened. A pending
+                    // stop() still ends the turn that requested it.
+                    if processed_this_turn != 0 && !self.stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
                     // Every cross-thread producer raises `wake_pending` after
                     // pushing, so the pending queue only needs to be locked
-                    // when the flag is set; a hot chain of locally scheduled
-                    // callbacks otherwise skips the mutex entirely.
+                    // when the flag is set.
                     if self.wake.ready_pending.load(Ordering::Acquire) {
                         let mut pending =
                             pending_ready.lock().expect("poisoned pending ready queue");
-                        if !pending.is_empty() {
-                            if ready_batch.is_empty() {
-                                std::mem::swap(&mut ready_batch, pending.deref_mut());
-                            } else {
-                                // A refill triggered by READY_DRAIN_SLICE
-                                // leaves
-                                // older items in `ready_batch`. Newly queued
-                                // items have to
-                                // go behind them: asyncio orders callbacks
-                                // by when they were scheduled, so putting the
-                                // fresh arrivals first would run a producer's
-                                // later `call_soon_threadsafe` before its
-                                // earlier
-                                // one. Rare with the GIL, because a producer
-                                // only
-                                // gets to enqueue while this thread is parked;
-                                // constant on a free-threaded interpreter,
-                                // where
-                                // producers append all through the drain.
-                                ready_batch.append(pending.deref_mut());
-                            }
-                        }
-                        if pending.is_empty() {
-                            self.wake.ready_pending.store(false, Ordering::Release);
-                        }
+                        std::mem::swap(&mut ready_batch, pending.deref_mut());
+                        self.wake.ready_pending.store(false, Ordering::Release);
                     }
 
-                    // Prioritize cross-thread wakeups such as signals and
-                    // transport connection_lost
-                    // notifications so they cannot be starved by a
-                    // hot stream of locally-scheduled callbacks.
+                    // Cross-thread wakeups such as signals and transport
+                    // connection_lost notifications go first.
                     if !local_ready.is_empty() {
                         if ready_batch.is_empty() {
                             std::mem::swap(&mut ready_batch, &mut *local_ready);
@@ -881,8 +870,6 @@ impl LoopCore {
                             ready_batch.extend(local_ready.drain(..));
                         }
                     }
-
-                    processed_since_refill = 0;
 
                     if ready_batch.is_empty() {
                         break;
@@ -894,6 +881,7 @@ impl LoopCore {
                     .expect("ready batch was checked as non-empty");
                 match item {
                     ReadyItem::Stop => {
+                        self.stop_requested.store(false, Ordering::Release);
                         self.state.lock().expect("poisoned loop state").stopping = true;
                     }
                     ReadyItem::Callback(callback) => {
@@ -1004,7 +992,6 @@ impl LoopCore {
                     }
                 }
 
-                processed_since_refill += 1;
                 processed_this_turn += 1;
                 if processed_this_turn >= MAX_READY_ITEMS_PER_TURN {
                     // stop() must not truncate callbacks already queued for
@@ -1037,7 +1024,7 @@ impl LoopCore {
             if pending_signal_error.is_none()
                 && let Err(err) = py.check_signals()
             {
-                let _ = self.send_command(LoopCommand::RequestStop);
+                let _ = self.schedule_stop();
                 pending_signal_error = Some(err);
                 continue;
             }
@@ -1054,8 +1041,14 @@ impl LoopCore {
             // worker-thread ping-pong on its cheaper spin path. As before,
             // hot Python callback chains must also service local I/O.
             if !ready_batch.is_empty() || !local_ready.is_empty() || spin_cooldown > 0 {
-                LOOP_RUNTIMES.with(|runtimes| {
-                    runtimes.borrow()[&loop_runtime_key].poll_once();
+                // Poll with the GIL released, as uvloop does around every
+                // poll: back-to-back turns otherwise hold it for the whole
+                // switch interval while threads that feed the loop
+                // (call_soon_threadsafe producers) wait for it.
+                py.detach(|| {
+                    LOOP_RUNTIMES.with(|runtimes| {
+                        runtimes.borrow()[&loop_runtime_key].poll_once();
+                    });
                 });
                 if !ready_batch.is_empty()
                     || !local_ready.is_empty()
@@ -1195,6 +1188,7 @@ impl LoopCore {
     /// stop semantics before `run_forever` returns.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
     pub fn schedule_stop(&self) -> Result<(), LoopCoreError> {
+        self.stop_requested.store(true, Ordering::Release);
         self.send_command(LoopCommand::RequestStop)
     }
 
