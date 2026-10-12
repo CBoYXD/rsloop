@@ -2,8 +2,24 @@
 
 Fork branch `pipeline/rsloop-66130a3e`, based on upstream v0.1.64 (`c9aa601`).
 Task: copytrade eff35519 (issues #1120/#1186). All numbers are from the
-operator's 3-CPU, 31 GiB machine, shared with other agents; every number
-below carries the 1-minute load average (`load1`) measured with it.
+operator's machine, shared with other agents: an i7-13650HX with 20 logical
+CPUs and 31 GiB.
+- CPUs 0–11 are 6 hyper-threaded P-cores (4.7–4.9 GHz); 12–19 are E-cores
+  (3.6 GHz).
+- Agents run under a CPU quota (3 cores for this agent, which is why `nproc`
+  reports 3). The benchmark containers do not; each is capped by its own
+  `--cpus`.
+
+Every number below carries the 1-minute load average (`load1`) measured with
+it. The benchmarks of fixes 4 and 5 also carry the CPU used outside the
+benchmark's containers (see [What fixes 4 and 5 cost](#what-fixes-4-and-5-cost)).
+
+**Status of the evidence.** The full-service table
+([Latest full run](#latest-full-run-b15c357)) was measured at `b15c357`
+(opt 3) and predates fixes 4 and 5. The final quiet-gated rounds that would
+have re-measured the services on `6101e34` were **not run** (operator
+decision, 2026-10-12), and that table's admin_api round 2 is contaminated by
+host load. See [Status and what is unverified](#status-and-what-is-unverified).
 
 ## Summary
 
@@ -43,19 +59,29 @@ below carries the 1-minute load average (`load1`) measured with it.
   `call_soon_threadsafe` is real but small: about 4 µs of CPU per request on
   the `rsloop` thread, and 11.4 → 7.8 µs per cross-thread callback in a
   microbenchmark.
-- **Fixes (3 commits).**
+- **Fixes (3 optimisations, 2 correctness fixes).**
   1. `5d2ce85` enqueues off-thread handles directly into the active run.
   2. `5cf71aa` parks instead of spinning by default (`RSLOOP_WAKE_SPIN_US`
      now defaults to 0 and remains an opt-in).
   3. `b15c357` runs one callback generation per turn, as asyncio's
      `_run_once` does, and polls the reactor with the GIL released between
      turns, as uvloop does.
-- **Result** ([Final table](#final-table), 3 interleaved rounds, load per
-  row):
-  - admin_api: fork +2.0% vs uvloop (geometric mean, worst row −2.9%).
-  - investor_api: +3.9% without the bimodal `/health/` probe (worst row
-    +1.5%); every c16 row that was 30–46% behind on 0.1.64 is now at or above
-    uvloop.
+  4. `ce45ef8` keeps `call_soon` / `call_soon_threadsafe` callbacks in
+     scheduling order across the two ready queues (a regression of opt 3
+     found by review).
+  5. `6101e34` fences the runtime's park against a racing cross-thread wake,
+     which v0.1.64 itself loses about once per 300–450 #115 repro runs.
+- **Result at `b15c357`** ([Latest full run](#latest-full-run-b15c357),
+  3 interleaved rounds, load per row). It predates fixes 4 and 5, which were
+  not re-measured on the services (see
+  [Status and what is unverified](#status-and-what-is-unverified)):
+  - investor_api: +3.9% vs uvloop without the bimodal `/health/` probe
+    (geometric mean, worst row +1.5%); every c16 row that was 30–46% behind
+    on 0.1.64 is at or above uvloop. Its rows ran at load1 1.1–3.8 with small
+    round spreads.
+  - admin_api: +2.0% vs uvloop (geometric mean, worst row −2.9%), **but round
+    2 of that run was contaminated by host load**, so the "within noise"
+    reading of the small differences is not supported.
 
 ## Setup
 
@@ -74,7 +100,7 @@ below carries the 1-minute load average (`load1`) measured with it.
   - The fork wheel is built with maturin (`--release --locked`, the
     repository's own release profile) on the image's base (Debian trixie,
     `python:3.14.5-slim`).
-  - For the final table it is installed into `rsperf-<api>:fork` by the
+  - For the full-service runs it is installed into `rsperf-<api>:fork` by the
     compose project (`~/.cache/rsloop-perf/fork-image/Dockerfile`), at
     `/opt/rsloop-fork`.
   - A local build of unmodified `c9aa601` behaves like the PyPI 0.1.64 wheel
@@ -244,7 +270,8 @@ Hypotheses tested:
 ### 3a. The second mechanism: completions in bursts (admin_api)
 
 The first full 3-round run on `5cf71aa` (table under
-[Final table](#final-table)) left admin_api at a geometric mean of −4.6% vs
+[Intermediate full run](#intermediate-full-run-at-5cf71aa-before-opt-3))
+left admin_api at a geometric mean of −4.6% vs
 uvloop. Its new-session counter was still elevated (e.g. `/auth/me` c64:
 uvloop 2.6, `5cf71aa` 14.1, 0.1.64 37.8 per 1k).
 
@@ -379,25 +406,229 @@ what the extra turns cost:
 `soon_chain` is the deliberate cost: a self-rescheduling callback is now one
 turn per step, as in asyncio and uvloop.
 
+### fix 4: `ce45ef8` keep scheduling order across the two ready queues
+
+Found by the independent review of `b15c357`.
+
+- **The defect.** The loop thread queues its own `call_soon` handles in a
+  lock-free local queue; other threads queue into the run's pending queue.
+  Opt 3 left local handles in place until the next turn, and the next turn
+  took the whole pending queue first (`src/engine/loop_core.rs:851-870` at
+  `b15c357`). A `call_soon_threadsafe` made after an earlier `call_soon`
+  therefore ran first whenever both waited for the same generation, even
+  when a thread start, a lock or a queue ordered the two calls.
+  - The review's repro: a callback runs `call_soon(record, 'older')`, a later
+    one starts and joins a thread that runs
+    `call_soon_threadsafe(record, 'newer')`. asyncio gives
+    `['older', 'newer']`; `b15c357` gave `['newer', 'older']`.
+  - `c9aa601` passes that case but already failed a tighter one: 50
+    alternating `call_soon` / thread-posted `call_soon_threadsafe` calls from
+    one callback do not interleave in call order there either.
+- **The fix.** Every off-thread item records how many items the loop thread
+  had queued for itself when it was queued (`LoopCore::local_enqueues`,
+  written only by the loop thread with a plain load and store). The drain
+  starts each generation by merging both queues on that mark
+  (`merge_ready_generation`, `src/engine/loop_core.rs:1868`): an off-thread
+  item goes behind exactly the local items queued before it.
+  - Marks are stored once per change (`PendingReady`,
+    `src/engine/commands.rs:86`), so a burst of off-thread items shares one.
+  - Work queued before a run (through the coordination thread) carries the
+    mark read before the run could queue anything, so it still goes first.
+  - Generations stay bounded, so opt 3's I/O interleaving is unchanged.
+- **Tests.** `tests/test_fast_callbacks.py`:
+  `test_earlier_call_soon_runs_before_later_threadsafe_call` (0, 5 and 130
+  queued callbacks), `test_call_soon_and_threadsafe_calls_interleave_in_scheduling_order`
+  and `test_threadsafe_call_runs_before_later_call_soon`, each against
+  asyncio and rsloop. Rust unit tests cover the merge
+  (`generation_order_tests`).
+  - On `b15c357`, 4 of the 5 rsloop cases fail; on `c9aa601`, the
+    interleaving case fails.
+  - The review's exact test file passes on `ce45ef8` and later on the host
+    (io_uring) and in Docker (epoll).
+
+### fix 5: `6101e34` a cross-thread wake could be lost by the runtime park
+
+Found while re-running the #115 repro for fix 4, many more times than
+before.
+
+- **Symptom.** In Docker (epoll), `issue1_repro.py` hung (killed by the 30 s
+  timeout, no output) in about 1 of 300–450 runs, on every build:
+
+  | build | hung runs |
+  |---|---|
+  | `c9aa601` (v0.1.64) | 2 of 440 |
+  | `b15c357` | 1 of 330 |
+  | `ce45ef8` | 1 of 110, 1 of 440, 0 of 418 |
+
+  The earlier 110-run checks had simply not hit it.
+- **What was stuck.** A core dump of a hung `c9aa601` run showed:
+  - the loop thread cycling through 40–50 ms `epoll_wait` parks, still alive;
+  - the coordination thread in `epoll_wait` with timeout −1.
+
+  A SIGALRM probe in a hung run showed the run-2 task of
+  `run_until_complete(asyncio.sleep(2))` still at its `def` line: its first
+  step, queued before `run_forever`, never ran. Work queued before a run
+  reaches the run only through the coordination thread, which was asleep.
+- **Root cause.** The runtime's `block_on` and its wakers use a store-then-load
+  handshake on two flags (`src/vibeio/executor.rs:290-299` and `:885-895`
+  at `c9aa601`):
+  - The waker stores the root's `ready` flag, then loads `waiting`.
+  - The park stores `waiting`, then loads `ready`.
+
+  Both sides used only release/acquire ordering. That allows store-load
+  reordering, as x86's store buffer does. Both loads can read the old
+  value: the waker skips the interrupt, and the park sleeps through the
+  wake. The loop thread recovers at its next ≤ 50 ms park deadline. The
+  coordination thread has no timer and never wakes again. The remote
+  task-queue wake (`src/vibeio/task.rs:77-94`) has the same shape.
+- **The fix.** A `SeqCst` fence between store and load on the park side and
+  on both waker sides. The fence costs one `mfence` per cross-thread wake;
+  same-thread wakes skip it.
+- **Tests.** `src/vibeio/executor.rs`:
+  `block_on_never_misses_a_wake_racing_with_the_park` and
+  `spawned_task_never_misses_a_wake_racing_with_the_park`.
+  - Each ping-pongs 100,000 wakes between a thread and the park on the mio
+    driver, and fails if progress stops for 5 s.
+  - Before the fix, the first test stalled at round 4,618. After it, 15
+    consecutive runs of both passed (3 M wakes).
+  - The #115 repro then ran 2,200 times in Docker without a hang. At the
+    old rate, about 5–7 hangs were expected.
+
+### What fixes 4 and 5 cost
+
+Both touch hot paths: every off-thread enqueue now reads the mark, the
+drain merges two queues, and every cross-thread wake pays a fence.
+
+Setup and gating:
+- Docker epoll, `--cpus 2`, rotated arms.
+- Each bench started only once CPU outside the benchmark's containers was
+  ≤ 2.0 cores, and was rerun if that went above 2.5 cores over the bench.
+- The micro harness starts a container per run, and that start/stop is
+  charged to dockerd and the CLI. That is why the column below reads 1.8–2.7
+  cores even on a quiet host.
+
+Results (CPU µs per op, wall in parentheses; medians of 3 rounds, 5 for the
+`xthread` rows):
+
+| bench | `b15c357` (opt 3) | `6101e34` (fixes 4–5) | uvloop | CPU outside benchmark, cores | load1 |
+|---|---|---|---|---|---|
+| `xthread_pingpong` | 6.22 (5.06) | 6.13 (4.99) | 6.76 (5.71) | 2.38 | 1.3–1.6 |
+| `xthread_task_pingpong` | 6.46 (6.02) | 6.31 (5.91) | 6.84 (6.71) | 2.42 | 1.7–1.8 |
+| `xthread_burst` (4 producers, 200k posts) | 0.49 (0.36) | 0.55 (0.38) | 0.47 (0.48) | 2.31 | 1.6 |
+| `tcp_pingpong` | 8.16 (11.96) | 7.74 (11.20) | 6.35 (9.95) | 2.66 | 2.1–2.2 |
+| `tcp_pingpong_c8` | 7.22 (8.62) | 6.86 (8.22) | 7.22 (8.77) | 2.49 | 1.7–1.8 |
+| `granian_like` CPU µs/req | 35.3 (74.6) | 36.6 (74.9) | 38.6 (75.5) | 2.29 | 1.6–1.8 |
+| `soon_chain` | 0.46 | 0.45 | 0.44 | 2.10 | 1.6–1.8 |
+| `timers_cancel` | 1.83 | 1.82 | 2.31 | 2.06 | 1.8–2.0 |
+
+- Every row is within its round-to-round spread except `xthread_burst`.
+  - There 4 Python threads post 50k callbacks each while contending for the
+    GIL. The fork is 0.04–0.06 µs per post slower in three separate runs
+    (rounds overlap: 0.44–0.56 vs 0.43–0.53).
+  - A variant with the counter on its own cache line measured 0.60, so the
+    gap is not false sharing on that field. It was not kept.
+  - At about 2 off-thread posts per request, that is ~0.1 µs on a request
+    costing ~1,000 µs of CPU.
+- `pool_churn` (4 + 2 pool, 8 driver threads, `--cpus 1`, 3 rounds, load
+  1.4–2.9):
+
+  | | `b15c357` | `6101e34` | uvloop |
+  |---|---|---|---|
+  | req/s (median) | 3,133 | 3,190 | 3,188 |
+  | connects /1k | 0.1–0.2 | 0.2–0.4 | 0.0 |
+  | post→task start µs | 101–109 | 184–187 | 148–150 |
+
+  - Throughput and churn are unchanged.
+  - Post→start rose because an off-thread request no longer runs ahead of
+    loop-thread work queued before it, which is fix 4's point. uvloop sits
+    between the two.
+
 ## 5. Correctness
 
 | check | where | result |
 |---|---|---|
-| `cargo test` (`scripts/run_rust_tests.py`, as `just test-rust`) | host | 352 passed after each commit. Needs a short `TMPDIR`: this session's default is too long for Unix-socket test paths (`SUN_LEN`). |
-| Python suite (`scripts/run_python_tests.py -m "not tooling and not stress and not slow_network"`, as `just test-fast`) | host, io_uring | opt 1: 525 passed. opt 2: 526 (+ the producer-order test). opt 3: 527 (+ the generation test). 141 skipped each time. |
-| Stress suite (`--stress-iterations -m stress`, as `just test-stress`) | host | opt 3: 5 passed, 3 skipped |
-| `cargo clippy --all-targets --all-features --locked -- -D warnings` (as `just clippy`), `cargo fmt --check`, ruff, pyright on the changed tests | host | clean at `b15c357` |
-| #115 greenlet lost wakeup / SIGSEGV (`issue1_repro.py`, every depth) | host io_uring (5 runs/depth) and Docker epoll (10 runs/depth, 110 runs) | 0 stuck, 0 SIGSEGV, 0 nonzero exits |
+| `cargo test` (`scripts/run_rust_tests.py`, as `just test-rust`) | host | 352 passed after each of opts 1–3; 355 at `ce45ef8` (+ 3 merge tests); 357 at `6101e34` (+ 2 wake-race tests). Needs a short `TMPDIR`: this session's default is too long for Unix-socket test paths (`SUN_LEN`). |
+| `cargo test --all-features` (`scripts/run_rust_tests.py --all-features`) | host | 455 at `ce45ef8`, 457 at `6101e34` |
+| Python core suite (`scripts/run_python_tests.py tests/test_*.py`) against the release wheel | host io_uring (CPython 3.14.7) and Docker epoll (3.14.5) | 642 passed, 12 skipped on both at `ce45ef8` and `6101e34` (632 + the 10 new ordering cases) |
+| Earlier fast subset (`-m "not tooling and not stress and not slow_network"`, as `just test-fast`) | host, io_uring | opt 1: 525 passed. opt 2: 526 (+ the producer-order test). opt 3: 527 (+ the generation test). 141 skipped each time. |
+| Stress suite (`--stress-iterations -m stress`, as `just test-stress`) | host | 5 passed at `b15c357`, `ce45ef8` and `6101e34` |
+| The review's ordering test (`test_review_ordering.py`, base/head wheels built separately) | host io_uring and Docker epoll | `c9aa601` 2 passed; `b15c357` 1 failed; `ce45ef8` and `6101e34` 2 passed on both |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` (as `just clippy`), `cargo fmt --check`, ruff (incl. `perf/bench/`), pyright on the changed tests | host | clean at `6101e34` |
+| #115 greenlet lost wakeup / SIGSEGV (`issue1_repro.py`, every depth) | host io_uring (5 runs/depth) and Docker epoll (10 runs/depth, 110 runs) | 0 stuck, 0 SIGSEGV, 0 nonzero exits at `6101e34` |
+| #115 at high repetition (same repro, Docker epoll, 4 containers in parallel) | Docker epoll | `6101e34`: 0 of 2,200 runs hung. Before fix 5: 1 hang per 300–450 runs on every build, `c9aa601` included (fix 5) |
 | #116 protocol leak (`issue2_repro.py`) and stdlib StreamReaderProtocol churn | host and Docker | 0 protocols alive, +0 B per connection |
 | asyncpg connect/close churn | Docker | 0 protocols alive |
 | #118 cancelled TimerHandle retention (`repro.py`, `asyncpg_repro.py`) | host and Docker | 0/20000 alive in A/B/C; 0 statement caches or protocols alive |
 
-Ran on `5cf71aa` and again on `b15c357`, with identical results. Script:
-`~/.cache/rsloop-perf/defects-fork.sh <site>`, the #1186 commands pointed at
-the fork build. Results: `~/.cache/rsloop-perf/run/defects-opt2/` and
-`run/defects-head-b15c357/`.
+The defect script ran on `5cf71aa`, on `b15c357` and on `6101e34`, with
+identical results. Script: `~/.cache/rsloop-perf/defects-fork.sh <site>`, the
+#1186 commands pointed at the fork build. Results:
+`~/.cache/rsloop-perf/run/defects-opt2/`, `run/defects-head-b15c357/` and
+`run/defects-head-6101e34/`.
 
-## Final table
+- On `6101e34`, the rsloop part of the Docker `asyncpg_repro.py` step printed
+  nothing once, while asyncio and uvloop printed theirs.
+  - The step took its full length. No core dump was recorded, and the repro
+    flushes every sample, so the container output was lost rather than the
+    run crashing.
+  - Reruns: 10 runs of the rsloop arm alone and 2 runs of the exact
+    three-loop step all exited 0 with 0 statement caches, states and
+    protocols alive (`run/defects-head-6101e34/i118_asyncpg_docker_*rerun*.txt`).
+- The 2,200 high-repetition #115 runs are in
+  `run/defects-head-6101e34/i115_stress/`.
+
+## Status and what is unverified
+
+The last full-service measurement is the `b15c357` run below. Fixes 4
+(`ce45ef8`) and 5 (`6101e34`) came after it. A quiet-gated re-run of the
+service harness on `6101e34` (the plan: rounds only while the machine is idle
+outside the benchmark containers) was started and interrupted, and the
+operator decided not to repeat it. No table in this file therefore measures
+the head of the branch on the services.
+
+What still stands:
+- **The root-cause analysis** (sections 2 and 3, opts 1–3). It rests on
+  per-thread profiles, perf/strace, the pool trace inside the services and
+  the standalone pool repro, each measured on the arm side by side, not on
+  the final table.
+- **investor_api at `b15c357`.** Its rows ran at load1 1.1–3.8 with round
+  spreads of 0.5–11%; fork at or above uvloop on 7 of 8 rows. The c16 rows
+  behind on 0.1.64 are the ones the root cause explains.
+- **The cost of fixes 4 and 5 in microbenchmarks** ([What fixes 4 and 5
+  cost](#what-fixes-4-and-5-cost)): quiet-gated, every row within its
+  round-to-round spread except `xthread_burst`, and `pool_churn` unchanged.
+- **Correctness** (section 5): test suites, the review's ordering test and
+  the defect repros at `ce45ef8`/`6101e34`.
+
+What is not verified:
+- **The service-level performance of `ce45ef8` and `6101e34`.** The micro
+  and `pool_churn` figures suggest no material change, but the full harness
+  has not been run on them.
+- **admin_api vs uvloop.** The `b15c357` table's round 2 was contaminated
+  (below), so its +2.0% geometric mean and the per-row differences of a few
+  percent cannot be read as "within noise". Rounds 1 and 3 ran at load1
+  about 2.5–3.5, but they were not analysed on their own and a clean re-run
+  is still needed.
+- **A free-threaded interpreter**, and any CPython other than 3.14.
+- **Quiet-machine conditions.** The agent host has 3 usable CPUs and ran
+  other work throughout; no row of the full tables meets a pinned low-load
+  condition.
+
+## Latest full run (`b15c357`)
+
+The independent review of this run (of the commit that introduced it,
+`c20aad5`) found the admin_api round 2 contaminated. Its rows ran at
+load1 4.2–10.6 for uvloop and up to 8.7 for the fork, against about 2.5–3.5
+in rounds 1 and 3. The throughput drops in that round are external
+contention, not loop noise:
+- fork `/positions/pnl-stats` c64: 985 rps vs 1,173 and 1,184 in the other
+  two rounds;
+- uvloop `/auth/me` c16: 1,574 vs 1,860 and 1,865.
+
+The medians below include that round, so they and their "within noise"
+reading are **not supported**; the per-round values are in the collapsed
+tables. The investor_api rows ran at load1 1.1–3.8 and are not affected in
+the same way.
 
 Fork at `b15c357` (the branch head's code; wheel baked into
 `rsperf-<api>:fork` by the compose project) vs rsloop 0.1.64 (the image pin)
@@ -437,7 +668,7 @@ vs uvloop 0.22.1 vs asyncio.
     1k vs uvloop's 2.1, at 1,737–2,054 vs 1,618 µs CPU per request. That
     residual on the probe endpoint is not explained here.
 
-### admin_api: median rps of 3 interleaved rounds (60 s each)
+#### `b15c357` admin_api: median rps of 3 interleaved rounds (60 s each)
 
 | endpoint | c | uvloop | asyncio | rsloop 0.1.64 | **fork** | fork vs uvloop | fork vs 0.1.64 | uvloop round spread | CPU-ms/1k uvloop / 0.1.64 / fork | new PG sessions/1k uvloop / 0.1.64 / fork | load1 at rows (min–max) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -491,7 +722,7 @@ fork ≥ uvloop on 5 of 8 rows; geometric mean fork vs uvloop +2.0%, fork vs rsl
 
 </details>
 
-### investor_api: median rps of 3 interleaved rounds (60 s each)
+#### `b15c357` investor_api: median rps of 3 interleaved rounds (60 s each)
 
 | endpoint | c | uvloop | asyncio | rsloop 0.1.64 | **fork** | fork vs uvloop | fork vs 0.1.64 | uvloop round spread | CPU-ms/1k uvloop / 0.1.64 / fork | new PG sessions/1k uvloop / 0.1.64 / fork | load1 at rows (min–max) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -667,8 +898,10 @@ fork ≥ uvloop on 6 of 8 rows; geometric mean fork vs uvloop +0.7%, fork vs rsl
 ## Remaining differences and notes
 
 - **Single serial TCP connection.** On a strict one-connection ping-pong the
-  fork costs about 0.7 µs more CPU per round trip than uvloop (8.3 vs 7.6).
-  With 8 connections it is 8.0 vs 7.5. That difference sits in the
+  fork costs about 0.7–1.4 µs more CPU per round trip than uvloop: 8.3 vs 7.6
+  at `b15c357`, and 7.7 vs 6.4 at `6101e34` in a later run. With 8
+  connections it is level or ahead (8.0 vs 7.5; 6.9 vs 7.2). That difference
+  sits in the
   loop-thread reader task and turn bookkeeping. It is not pursued here: a
   structural change would be needed (e.g. dispatching `data_received`
   straight from the reactor callback, as libuv does), and it does not show on
@@ -685,14 +918,21 @@ fork ≥ uvloop on 6 of 8 rows; geometric mean fork vs uvloop +0.7%, fork vs rsl
   appear in any profile here (`smol`/`blocking` threads < 4 µs/req).
 - **Opting back into the spin.** `RSLOOP_WAKE_SPIN_US=50` restores the old
   behaviour. It only pays off when the waking threads never hold the GIL.
-- **Upstream.** Nothing has been sent; contact needs the operator's yes. The
-  three commits are self-contained and would apply to upstream `master` as
-  they stand.
+- **Upstream.** Nothing has been sent; contact needs the operator's yes.
+  - The five commits are self-contained and would apply to upstream `master`
+    as they stand.
+  - Fix 5 (`6101e34`) matters on its own: v0.1.64 itself loses cross-thread
+    wakes of its coordination thread (about 1 in 300–450 runs of the #115
+    repro), which can strand callbacks queued before a run.
 - **Behaviour change in opt 3.** Callbacks scheduled during a turn now run in
   the next turn, after an I/O poll, which is asyncio's and uvloop's order.
-  rsloop's own suite (527 tests) and the stress suite pass. Code that relied
-  on rsloop running chains to quiescence before polling I/O would see I/O
-  interleaved earlier, as it would on asyncio.
+  - rsloop's own suites pass: 642 core tests at `6101e34`, plus the stress
+    suite.
+  - Code that relied on rsloop running chains to quiescence before polling
+    I/O would see I/O interleaved earlier, as it would on asyncio.
+  - Since fix 4, `call_soon` and `call_soon_threadsafe` callbacks also run in
+    the order they were scheduled. On v0.1.64, off-thread callbacks could
+    overtake earlier loop-thread ones.
 
 ## Reproducing
 
@@ -703,8 +943,12 @@ All under `~/.cache/rsloop-perf/`:
 | `builder/` | wheel builder image (`python:3.14.5-slim` + nightly-2026-09-25 + maturin 1.15.0); `build-wheel.sh <src> <out>` |
 | `bench/site.sh` | unpacks a wheel into a `PYTHONPATH` dir under `sites/` |
 | `override.yml`, `bin-dc.sh`, `fork-image/` | the isolated `rsperf` compose project and the fork image build |
-| `bench/harness.py` | the #1120 harness for `rsperf`. Arms `uvloop`, `rsloop`, `fork`, `fork:<site>`, `<arm>@nospin`. `harness.py api <api> [rounds]` |
-| `bench/final.sh`, `bench/compare_final.py` | the final run and its table |
+| `bench/harness.py` | the #1120 harness for `rsperf`. Arms `uvloop`, `rsloop`, `fork`, `fork:<site>`, `<arm>@nospin`. `harness.py api <api> [rounds]`. Quiet-gated since the final run (`QUIET_*` variables); copied into `perf/bench/` |
+| `bench/quiet.py` | the quiet-machine probe: CPU used outside the `rsperf_*` containers over a window; copied into `perf/bench/` |
+| `bench/final2.sh`, `bench/compare_final.py` | the quiet-gated final run (one rotated round per call) and its table (`compare_final.py _final2`); `compare_final.py` is copied into `perf/bench/`. That run was interrupted and not repeated (see [Status and what is unverified](#status-and-what-is-unverified)). `bench/final.sh` produced the `b15c357` run |
+| `fix-fifo/scripts/i115_stress.sh <site> <runs/depth> <out>` | the #115 repro at high repetition in Docker, with a faulthandler dump of any hung run |
+| `fix-fifo/diag/i115_alarm.py`, `fix-fifo/cores/` | the SIGALRM probe and the core dumps (with a gdb sysroot) that located fix 5 |
+| `fix-fifo/scripts/micro_gated.py` | quiet-gated wrapper around `bench/run_micro.sh` |
 | `bench/profile.py` | per-thread CPU, strace, perf and py-spy for one arm under oha |
 | `bench/run_micro.sh`, `bench/micro.py`, `bench/churn.sh`, `bench/pool_churn.py` | microbenchmarks and the pool-churn repro; `micro.py` and `pool_churn.py` are copied into `perf/bench/` |
 | `defects-fork.sh` | #115/#116/#118 re-checks for a fork build |

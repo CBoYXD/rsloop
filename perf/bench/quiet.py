@@ -73,6 +73,33 @@ def top_level():
     }
 
 
+def host_clock():
+    """P-core (CPUs 0-11) average clock in MHz and package temperature in C, as a host-state snapshot."""
+    mhz = []
+    for cpu in range(12):
+        try:
+            with open(
+                f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_avg_freq"
+            ) as f:
+                mhz.append(int(f.read()) / 1000)
+        except (OSError, ValueError):
+            pass
+    temp = None
+    for zone in sorted(os.listdir("/sys/class/thermal")):
+        try:
+            with open(f"/sys/class/thermal/{zone}/type") as f:
+                if f.read().strip() != "x86_pkg_temp":
+                    continue
+            with open(f"/sys/class/thermal/{zone}/temp") as f:
+                temp = int(f.read()) / 1000
+        except OSError:
+            continue
+    return {
+        "pcore_mhz": round(sum(mhz) / len(mhz)) if mhz else None,
+        "pkg_temp_c": temp,
+    }
+
+
 class Window:
     """CPU accounting over one interval; the own-cgroup set is fixed at start (containers stay up)."""
 
@@ -105,6 +132,7 @@ class Window:
             "own_cgroups": len(self.paths),
             "load1": os.getloadavg()[0],
             "top_cores": top,
+            **host_clock(),
         }
 
 

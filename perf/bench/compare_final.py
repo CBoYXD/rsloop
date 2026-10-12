@@ -129,6 +129,14 @@ def table(api):
             f"fork vs rsloop 0.1.64 {pct(geomean(vs_old), 1)}."
         ),
         "",
+        "Rounds per arm: "
+        + ", ".join(
+            f"{arm} {len({k[3] for k in clean if k[2] == arm})}"
+            for arm in ARMS
+            if any(k[2] == arm for k in clean)
+        )
+        + ".",
+        "",
         f"Clean rows: {len(clean)}; contaminated attempts discarded and re-measured: {sum(dirty.values())}"
         + (
             f"; rows without a clean attempt: {sorted(k for k in dirty if k not in clean)}"
