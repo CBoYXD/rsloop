@@ -9,7 +9,7 @@ below carries the 1-minute load average (`load1`) measured with it.
 
 - **Root cause.** rsloop's loop thread spun for up to 50 µs, with the GIL
   released, waiting for a cross-thread wake before parking
-  (`src/engine/loop_core.rs:128-143` and `:1058-1090` at `c9aa601`).
+  (`src/engine/loop_core.rs:128-143` and `:1047-1090` at `c9aa601`).
   - Behind Granian, those wakes come from Python threads
     (`loop.call_soon_threadsafe` in `granian/_futures.py`) that still hold the
     GIL when the flag flips. The spinning loop thread therefore queued for the
@@ -31,7 +31,7 @@ below carries the 1-minute load average (`load1`) measured with it.
 - **Second, smaller cause: turns ran to quiescence.** It surfaced on
   admin_api once the spin was gone. Each `run_forever` turn took in the
   callbacks it scheduled itself (every 64 items, up to 1024) and polled the
-  reactor only when nothing was left (`src/engine/loop_core.rs:838-890` at
+  reactor only when nothing was left (`src/engine/loop_core.rs:805-857` at
   `c9aa601`).
   - Under saturation, DB responses piled up between polls and completed in
     one burst. More connections came back than the pool's idle queue holds
@@ -50,8 +50,12 @@ below carries the 1-minute load average (`load1`) measured with it.
   3. `b15c357` runs one callback generation per turn, as asyncio's
      `_run_once` does, and polls the reactor with the GIL released between
      turns, as uvloop does.
-- **Result.** See [Final table](#final-table): fork vs rsloop 0.1.64 vs
-  uvloop vs asyncio, both APIs, 3 interleaved rounds, with load per row.
+- **Result** ([Final table](#final-table), 3 interleaved rounds, load per
+  row):
+  - admin_api: fork +2.0% vs uvloop (geometric mean, worst row −2.9%).
+  - investor_api: +3.9% without the bimodal `/health/` probe (worst row
+    +1.5%); every c16 row that was 30–46% behind on 0.1.64 is now at or above
+    uvloop.
 
 ## Setup
 
@@ -226,7 +230,7 @@ Hypotheses tested:
 | # | Hypothesis | Test | Verdict |
 |---|---|---|---|
 | H1 | Every off-thread `call_soon_threadsafe` takes two wakeups (channel → coordination thread → run queue → loop thread), `src/engine/loop_core.rs:479-497` and `src/engine/dispatcher.rs:206` at `c9aa601`. | microbench `xthread_pingpong`; per-thread CPU | **Confirmed, minor.** 11.4 → 7.8 µs CPU per cross-thread callback; `rsloop` thread 4.3 → 0 µs/req. Does not touch the churn (61 → 55 /1k). Fixed in opt 1. |
-| H2 | The 50 µs loop-thread spin before parking (`loop_core.rs:128-143`, `:1058-1090`) hurts when wakes come from GIL-holding Python threads. | `RSLOOP_WAKE_SPIN_US=0` on the same build | **Confirmed, root cause.** Churn 55 → 0.2 /1k, post→start 1.7 ms → 39 µs, 4× req/s. Fixed in opt 2. |
+| H2 | The 50 µs loop-thread spin before parking (`loop_core.rs:128-143`, `:1047-1090`) hurts when wakes come from GIL-holding Python threads. | `RSLOOP_WAKE_SPIN_US=0` on the same build | **Confirmed, root cause.** Churn 55 → 0.2 /1k, post→start 1.7 ms → 39 µs, 4× req/s. Fixed in opt 2. |
 | H2a | The spin starves the reactor: while consecutive spins keep catching wakes (up to `MAX_CONSECUTIVE_SPINS` = 64) the loop never polls its sockets. | Variant polling the reactor (`poll_once`) after every caught spin | **Refuted.** Still 55–82 connects /1k. |
 | H2b | The spin burns the container's CFS quota and gets the cgroup throttled. | Same repro at `--cpus 2` and `--cpus 3` | **Refuted.** Churn identical (53–56 /1k) without a binding quota. |
 | H2c | GIL convoy: the spinner sees the wake while its producer still holds the GIL and queues behind the driver threads passing the GIL among themselves (`take_gil` waits up to the 5 ms switch interval before forcing a drop). A parked loop wakes after the producer released the GIL and drains everything queued. | Latency split above; no-spin variant | **Consistent with every measurement.** Post→start and resume latencies drop 30–40×, and no other loop change matters. |
@@ -234,7 +238,7 @@ Hypotheses tested:
 | H4 | Ready-queue / `call_soon` cost, GIL attach per callback. | microbench `soon_chain` | **Refuted.** rsloop 0.17 µs/op vs uvloop 0.45 (the drain holds the GIL across a batch). |
 | H5 | Transport read/write path (loop-thread reader task, small-write staging for client protocols: `src/transport/stream/builder.rs:154`, `core_write.rs:416`). | `tcp_pingpong`, `tcp_pingpong_c8` | **Not material here.** With 8 connections the fork is level or ahead (8.2 vs 9.2 µs CPU/rt). A single strictly serial connection is still slower: 10.5 vs 8.0 µs CPU per round trip (0.1.64: 15.2). Left as is (see Remaining differences). |
 | H6 | io_uring vs epoll. | Docker runs epoll (seccomp), as production does | **Not the cause.** The harness gap is on epoll. |
-| H8 | Each turn runs to quiescence before the reactor is polled again (`loop_core.rs:838-890` at `c9aa601`), so I/O completions arrive in bursts larger than a pool's idle queue. | Pool trace inside admin_api (section 3a); opt 3 | **Confirmed, second cause.** Surfaced once the spin was gone: about 690 full-queue check-ins in 20 s on `5cf71aa` vs at most a few on uvloop. Fixed in opt 3. |
+| H8 | Each turn runs to quiescence before the reactor is polled again (`loop_core.rs:805-857` at `c9aa601`), so I/O completions arrive in bursts larger than a pool's idle queue. | Pool trace inside admin_api (section 3a); opt 3 | **Confirmed, second cause.** Surfaced once the spin was gone: about 690 full-queue check-ins in 20 s on `5cf71aa` vs at most a few on uvloop. Fixed in opt 3. |
 | H7 | Future/Task bridging with Granian's `CallbackScheduler`. | Granian threads ≈ 35–42 µs/req on every arm | **Refuted.** Same cost on every loop. |
 
 ### 3a. The second mechanism: completions in bursts (admin_api)
@@ -280,7 +284,7 @@ newer.
 
 ### opt 1: `5d2ce85` off-thread `call_soon_threadsafe` joins the active run directly
 
-`LoopCore::schedule_ready_handle` (`src/engine/loop_core.rs:492`):
+`LoopCore::schedule_ready_handle` (`src/engine/loop_core.rs:496`):
 
 - An off-thread handle now goes straight into the active run's pending queue
   and wakes the loop once, while no earlier handle is still on the command
@@ -333,10 +337,10 @@ Harness, quick form (investor_api, c16, 30 s, 2 rounds, rotated):
 
 ### opt 3: `b15c357` one callback generation per turn; poll I/O with the GIL released
 
-`run_forever` (`src/engine/loop_core.rs:839-878`):
+`run_forever` (`src/engine/loop_core.rs:841-878`):
 - A turn now runs the callbacks queued when it started. Newer ones wait for
   the next turn, after a non-blocking reactor poll.
-- That per-turn poll (`loop_core.rs:1043-1052`) runs under `py.detach`, as
+- That per-turn poll (`loop_core.rs:1044-1052`) runs under `py.detach`, as
   uvloop polls without the GIL.
   - A first version kept the GIL across the poll. Back-to-back turns then
     held it for the whole switch interval while `call_soon_threadsafe`
@@ -395,7 +399,270 @@ the fork build. Results: `~/.cache/rsloop-perf/run/defects-opt2/` and
 
 ## Final table
 
-_The final 3-round run on `b15c357` is in progress; this section is filled from it._
+Fork at `b15c357` (the branch head's code; wheel baked into
+`rsperf-<api>:fork` by the compose project) vs rsloop 0.1.64 (the image pin)
+vs uvloop 0.22.1 vs asyncio.
+
+- The #1120 harness method: 3 interleaved rounds with rotated arm order,
+  15 s warm-up, 60 s per row, Granian with 2 workers, `--cpus 2`.
+- Run from 01:01 to 04:46 UTC on 2026-10-12. `load1` for every row is in the
+  table, and per round in the collapsed details.
+- "new PG sessions/1k" is the `pg_stat_database.sessions` delta. It also
+  counts each service's own per-call connections: admin_api persists every
+  INFO+ log line through a new connection, and investor_api's `/health/`
+  probe connects per call.
+
+**Verdict.**
+
+| | fork vs uvloop, geometric mean (all rows / without `/health`) | worst row | fork vs 0.1.64 (all / without `/health`) |
+|---|---|---|---|
+| admin_api | **+2.0% / +2.4%**, at or above uvloop on 5 of 8 rows | −2.9% (`/auth/me` c16; uvloop's own round spread there is 18.5%) | +5.9% / +6.7% |
+| investor_api | +24.7% / **+3.9%**, at or above uvloop on 7 of 8 rows | −1.8% (`/health/` c64) | +20.9% / +30.2% |
+
+- **investor_api c16 rows** (the ones behind on 0.1.64):
+  - `/auth/me`: +6.3% vs uvloop (0.1.64: −46%).
+  - `/notifications/unread-count`: +1.5% (0.1.64: −41%).
+  - `/reports/`: +3.7% (0.1.64: −30%).
+  - CPU per 1k requests and new sessions per 1k are at uvloop's level.
+- **`/health/` c16 is bimodal on every loop** (p50 ≈ 5–15 ms at ~400–650
+  rps, or ≈ 250 ms at ~80–100 rps). It is bound by a per-call NATS connect
+  and close (`infrastructure/adapters/health_probe.py:57`), not by the loop.
+  - uvloop landed in the slow mode in all 3 rounds here, hence the +374% and
+    the +24.7% all-rows mean.
+  - Extra 20 s windows (load 1.5–1.8): fork 548 and 632 rps, uvloop 668 and
+    104.
+  - The fork's round-3 row (24 rps, p50 758 ms) is the slow mode under a
+    different arm order.
+  - Also in those fast-mode windows: the fork opened 11–25 new sessions per
+    1k vs uvloop's 2.1, at 1,737–2,054 vs 1,618 µs CPU per request. That
+    residual on the probe endpoint is not explained here.
+
+### admin_api: median rps of 3 interleaved rounds (60 s each)
+
+| endpoint | c | uvloop | asyncio | rsloop 0.1.64 | **fork** | fork vs uvloop | fork vs 0.1.64 | uvloop round spread | CPU-ms/1k uvloop / 0.1.64 / fork | new PG sessions/1k uvloop / 0.1.64 / fork | load1 at rows (min–max) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `/health` | 16 | 427 | 432 | 422 | **430** | +0.7% | +1.8% | 3.2% | 3,366 / 3,880 / 3,216 | 41.7 / 81.2 / 45.1 | 1.3–10.6 |
+| `/health` | 64 | 444 | 448 | 426 | **448** | +0.8% | +5.3% | 3.5% | 4,388 / 4,660 / 4,395 | 99.1 / 156.4 / 103.1 | 2.0–9.0 |
+| `/auth/me` | 16 | 1,860 | 1,642 | 1,688 | **1,806** | -2.9% | +7.0% | 18.5% | 1,074 / 1,181 / 1,106 | 3.4 / 19.5 / 4.4 | 2.5–9.0 |
+| `/auth/me` | 64 | 1,728 | 1,762 | 1,657 | **1,891** | +9.4% | +14.1% | 14.2% | 1,156 / 1,208 / 1,057 | 2.9 / 17.9 / 5.6 | 2.7–7.7 |
+| `/trade-sessions/` | 16 | 507 | 508 | 524 | **497** | -1.9% | -5.1% | 5.3% | 3,942 / 3,811 / 4,016 | 17.2 / 26.1 / 19.0 | 2.8–6.2 |
+| `/trade-sessions/` | 64 | 487 | 495 | 480 | **501** | +3.0% | +4.4% | 7.5% | 4,122 / 4,173 / 3,997 | 9.1 / 26.0 / 12.2 | 2.8–8.7 |
+| `/positions/pnl-stats` | 16 | 1,098 | 1,080 | 1,037 | **1,092** | -0.6% | +5.2% | 6.7% | 1,814 / 1,919 / 1,826 | 7.6 / 30.3 / 8.1 | 2.9–6.9 |
+| `/positions/pnl-stats` | 64 | 1,084 | 1,125 | 1,011 | **1,173** | +8.2% | +16.1% | 2.5% | 1,843 / 1,981 / 1,704 | 4.1 / 26.5 / 7.9 | 3.1–6.9 |
+
+fork ≥ uvloop on 5 of 8 rows; geometric mean fork vs uvloop +2.0%, fork vs rsloop 0.1.64 +5.9%.
+
+<details><summary>admin_api: every row, every round (rps, load1)</summary>
+
+| endpoint | c | arm | r1 | r2 | r3 |
+|---|---|---|---|---|---|
+| `/health` | 16 | uvloop | 427 (1.3) | 432 (10.6) | 418 (3.9) |
+| `/health` | 64 | uvloop | 433 (2.0) | 444 (9.0) | 448 (3.6) |
+| `/auth/me` | 16 | uvloop | 1,860 (2.5) | 1,574 (9.0) | 1,865 (3.6) |
+| `/auth/me` | 64 | uvloop | 1,733 (2.8) | 1,517 (7.7) | 1,728 (3.6) |
+| `/trade-sessions/` | 16 | uvloop | 507 (2.8) | 484 (6.2) | 509 (3.7) |
+| `/trade-sessions/` | 64 | uvloop | 488 (2.8) | 454 (5.7) | 487 (3.7) |
+| `/positions/pnl-stats` | 16 | uvloop | 1,117 (3.0) | 1,046 (4.9) | 1,098 (3.3) |
+| `/positions/pnl-stats` | 64 | uvloop | 1,084 (3.3) | 1,099 (4.2) | 1,072 (3.1) |
+| `/health` | 16 | rsloop | 427 (3.0) | 422 (2.9) | 366 (4.5) |
+| `/health` | 64 | rsloop | 426 (2.8) | 429 (3.0) | 421 (5.2) |
+| `/auth/me` | 16 | rsloop | 1,689 (3.1) | 1,490 (3.1) | 1,688 (5.2) |
+| `/auth/me` | 64 | rsloop | 1,657 (3.2) | 1,509 (4.0) | 1,684 (4.0) |
+| `/trade-sessions/` | 16 | rsloop | 524 (3.0) | 496 (3.7) | 535 (3.1) |
+| `/trade-sessions/` | 64 | rsloop | 481 (3.4) | 472 (3.6) | 480 (3.1) |
+| `/positions/pnl-stats` | 16 | rsloop | 1,037 (3.4) | 975 (3.7) | 1,097 (2.9) |
+| `/positions/pnl-stats` | 64 | rsloop | 1,011 (3.3) | 1,000 (3.5) | 1,015 (3.3) |
+| `/health` | 16 | fork | 434 (3.0) | 398 (3.2) | 430 (3.4) |
+| `/health` | 64 | fork | 448 (2.0) | 469 (3.6) | 433 (2.8) |
+| `/auth/me` | 16 | fork | 1,806 (2.9) | 1,785 (4.5) | 1,962 (3.5) |
+| `/auth/me` | 64 | fork | 1,913 (2.7) | 1,744 (5.5) | 1,891 (3.4) |
+| `/trade-sessions/` | 16 | fork | 519 (3.0) | 419 (6.0) | 497 (4.2) |
+| `/trade-sessions/` | 64 | fork | 502 (3.1) | 428 (8.7) | 501 (3.5) |
+| `/positions/pnl-stats` | 16 | fork | 1,092 (3.1) | 821 (6.9) | 1,092 (3.1) |
+| `/positions/pnl-stats` | 64 | fork | 1,173 (3.5) | 985 (6.9) | 1,184 (3.6) |
+| `/health` | 16 | asyncio | 430 (2.6) | 449 (6.9) | 432 (3.5) |
+| `/health` | 64 | asyncio | 441 (2.9) | 461 (6.7) | 448 (2.4) |
+| `/auth/me` | 16 | asyncio | 1,765 (3.1) | 1,642 (4.8) | 1,393 (4.0) |
+| `/auth/me` | 64 | asyncio | 1,762 (2.8) | 1,808 (4.9) | 1,759 (4.0) |
+| `/trade-sessions/` | 16 | asyncio | 450 (2.9) | 511 (3.8) | 508 (3.8) |
+| `/trade-sessions/` | 64 | asyncio | 501 (3.4) | 438 (3.4) | 495 (3.5) |
+| `/positions/pnl-stats` | 16 | asyncio | 1,135 (3.4) | 907 (5.3) | 1,080 (3.8) |
+| `/positions/pnl-stats` | 64 | asyncio | 1,125 (3.3) | 922 (6.6) | 1,145 (3.6) |
+
+</details>
+
+### investor_api: median rps of 3 interleaved rounds (60 s each)
+
+| endpoint | c | uvloop | asyncio | rsloop 0.1.64 | **fork** | fork vs uvloop | fork vs 0.1.64 | uvloop round spread | CPU-ms/1k uvloop / 0.1.64 / fork | new PG sessions/1k uvloop / 0.1.64 / fork | load1 at rows (min–max) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `/health/` | 16 | 86 | 401 | 430 | **405** | +373.9% | -5.7% | 11.1% | 2,174 / 2,088 / 2,064 | 89.0 / 15.5 / 15.1 | 1.8–3.7 |
+| `/health/` | 64 | 49 | 48 | 49 | **48** | -1.8% | -0.5% | 0.5% | 1,643 / 1,960 / 1,916 | 91.1 / 92.2 / 92.4 | 1.1–2.3 |
+| `/auth/me` | 16 | 2,306 | 2,379 | 1,246 | **2,451** | +6.3% | +96.8% | 10.3% | 867 / 1,605 / 816 | 3.2 / 53.4 / 2.2 | 1.2–3.3 |
+| `/auth/me` | 64 | 2,333 | 2,368 | 2,493 | **2,427** | +4.0% | -2.6% | 4.2% | 858 / 803 / 824 | 1.8 / 2.6 / 1.9 | 2.0–3.2 |
+| `/notifications/unread-count` | 16 | 1,893 | 1,905 | 1,113 | **1,921** | +1.5% | +72.6% | 7.6% | 1,056 / 1,797 / 1,041 | 3.4 / 51.9 / 4.7 | 2.4–3.7 |
+| `/notifications/unread-count` | 64 | 1,873 | 1,891 | 1,949 | **1,932** | +3.1% | -0.9% | 5.0% | 1,068 / 1,027 / 1,036 | 2.3 / 4.2 / 2.3 | 2.2–3.8 |
+| `/reports/` | 16 | 1,511 | 1,541 | 1,058 | **1,567** | +3.7% | +48.1% | 1.6% | 1,323 / 1,890 / 1,276 | 6.6 / 42.6 / 3.4 | 2.7–3.5 |
+| `/reports/` | 64 | 1,521 | 1,561 | 1,591 | **1,593** | +4.7% | +0.1% | 4.0% | 1,315 / 1,258 / 1,256 | 2.9 / 3.3 / 2.7 | 2.6–3.6 |
+
+fork ≥ uvloop on 7 of 8 rows; geometric mean fork vs uvloop +24.7%, fork vs rsloop 0.1.64 +20.9%.
+
+<details><summary>investor_api: every row, every round (rps, load1)</summary>
+
+| endpoint | c | arm | r1 | r2 | r3 |
+|---|---|---|---|---|---|
+| `/health/` | 16 | uvloop | 90 (2.7) | 81 (2.0) | 86 (2.2) |
+| `/health/` | 64 | uvloop | 49 (1.7) | 49 (1.1) | 49 (1.3) |
+| `/auth/me` | 16 | uvloop | 2,306 (1.4) | 2,353 (1.4) | 2,133 (1.2) |
+| `/auth/me` | 64 | uvloop | 2,285 (2.8) | 2,333 (2.5) | 2,382 (2.4) |
+| `/notifications/unread-count` | 16 | uvloop | 1,796 (2.9) | 1,893 (2.9) | 1,933 (2.6) |
+| `/notifications/unread-count` | 64 | uvloop | 1,825 (3.2) | 1,873 (2.9) | 1,916 (2.9) |
+| `/reports/` | 16 | uvloop | 1,511 (3.2) | 1,499 (3.5) | 1,522 (2.8) |
+| `/reports/` | 64 | uvloop | 1,493 (3.2) | 1,521 (3.6) | 1,552 (2.9) |
+| `/health/` | 16 | rsloop | 430 (3.7) | 447 (2.1) | 377 (2.3) |
+| `/health/` | 64 | rsloop | 49 (2.2) | 48 (2.3) | 49 (1.9) |
+| `/auth/me` | 16 | rsloop | 1,228 (1.3) | 1,246 (2.4) | 2,265 (1.6) |
+| `/auth/me` | 64 | rsloop | 2,490 (2.6) | 2,493 (3.2) | 2,495 (2.5) |
+| `/notifications/unread-count` | 16 | rsloop | 1,113 (2.9) | 1,110 (3.7) | 1,882 (2.6) |
+| `/notifications/unread-count` | 64 | rsloop | 1,921 (2.8) | 1,952 (3.8) | 1,949 (2.4) |
+| `/reports/` | 16 | rsloop | 1,058 (2.9) | 1,561 (2.9) | 1,053 (2.9) |
+| `/reports/` | 64 | rsloop | 1,588 (3.1) | 1,605 (2.8) | 1,591 (3.0) |
+| `/health/` | 16 | fork | 405 (2.3) | 447 (2.0) | 24 (2.6) |
+| `/health/` | 64 | fork | 48 (1.9) | 48 (1.6) | 48 (1.1) |
+| `/auth/me` | 16 | fork | 2,396 (1.2) | 2,451 (3.3) | 2,487 (1.2) |
+| `/auth/me` | 64 | fork | 2,417 (2.2) | 2,427 (2.9) | 2,471 (2.0) |
+| `/notifications/unread-count` | 16 | fork | 1,933 (2.6) | 1,825 (3.5) | 1,921 (2.4) |
+| `/notifications/unread-count` | 64 | fork | 1,932 (2.7) | 1,929 (3.7) | 1,961 (2.7) |
+| `/reports/` | 16 | fork | 1,567 (3.1) | 1,554 (3.5) | 1,594 (2.8) |
+| `/reports/` | 64 | fork | 1,574 (3.2) | 1,593 (2.9) | 1,604 (3.2) |
+| `/health/` | 16 | asyncio | 357 (1.8) | 405 (1.9) | 401 (2.8) |
+| `/health/` | 64 | asyncio | 48 (1.5) | 48 (2.1) | 48 (2.2) |
+| `/auth/me` | 16 | asyncio | 2,379 (1.5) | 2,375 (1.6) | 2,428 (1.4) |
+| `/auth/me` | 64 | asyncio | 2,324 (2.1) | 2,369 (2.3) | 2,368 (2.3) |
+| `/notifications/unread-count` | 16 | asyncio | 1,910 (2.4) | 1,902 (2.7) | 1,905 (2.7) |
+| `/notifications/unread-count` | 64 | asyncio | 1,846 (2.2) | 1,891 (2.8) | 1,896 (2.7) |
+| `/reports/` | 16 | asyncio | 1,541 (2.7) | 1,587 (3.3) | 1,526 (3.0) |
+| `/reports/` | 64 | asyncio | 1,513 (2.6) | 1,571 (3.0) | 1,561 (2.9) |
+
+</details>
+
+### Intermediate full run at `5cf71aa` (before opt 3)
+
+Run from 20:33 to 00:21 UTC, same method. admin_api geometric mean −4.6% vs
+uvloop (worst row −15.7%, `/positions/pnl-stats` c64); investor_api +0.7%
+(+2.4% without `/health`). That admin_api gap and its session counter led to
+section 3a and opt 3.
+
+<details><summary>Full tables for the 5cf71aa run</summary>
+
+#### `5cf71aa` admin_api: median rps of 3 interleaved rounds (60 s each)
+
+| endpoint | c | uvloop | asyncio | rsloop 0.1.64 | **fork** | fork vs uvloop | fork vs 0.1.64 | uvloop round spread | CPU-ms/1k uvloop / 0.1.64 / fork | new PG sessions/1k uvloop / 0.1.64 / fork | load1 at rows (min–max) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `/health` | 16 | 422 | 421 | 434 | **421** | -0.3% | -3.0% | 3.4% | 3,685 / 3,401 / 3,259 | 37.1 / 56.9 / 46.6 | 1.4–9.5 |
+| `/health` | 64 | 442 | 439 | 409 | **443** | +0.3% | +8.4% | 6.8% | 4,425 / 4,851 / 4,445 | 70.6 / 137.1 / 94.4 | 1.9–10.6 |
+| `/auth/me` | 16 | 1,641 | 1,493 | 1,301 | **1,405** | -14.4% | +8.0% | 14.0% | 1,208 / 1,533 / 1,326 | 2.9 / 13.8 / 9.0 | 3.0–12.8 |
+| `/auth/me` | 64 | 1,686 | 1,627 | 1,188 | **1,563** | -7.3% | +31.6% | 10.4% | 1,185 / 1,684 / 1,280 | 2.6 / 37.8 / 14.1 | 3.6–10.9 |
+| `/trade-sessions/` | 16 | 444 | 439 | 451 | **428** | -3.7% | -5.2% | 18.3% | 4,490 / 4,415 / 4,668 | 21.4 / 30.7 / 39.7 | 3.9–8.9 |
+| `/trade-sessions/` | 64 | 416 | 448 | 441 | **467** | +12.2% | +5.9% | 19.1% | 4,781 / 4,499 / 4,291 | 7.3 / 25.9 / 21.4 | 3.6–8.3 |
+| `/positions/pnl-stats` | 16 | 1,077 | 987 | 836 | **1,023** | -5.0% | +22.3% | 6.8% | 1,842 / 2,274 / 1,950 | 7.4 / 28.0 / 19.2 | 3.6–9.5 |
+| `/positions/pnl-stats` | 64 | 1,053 | 1,021 | 1,016 | **888** | -15.7% | -12.6% | 27.4% | 1,895 / 1,954 / 2,219 | 4.2 / 24.2 / 21.9 | 2.8–8.8 |
+
+fork ≥ uvloop on 2 of 8 rows; geometric mean fork vs uvloop -4.6%, fork vs rsloop 0.1.64 +6.1%.
+
+<details><summary>admin_api: every row, every round (rps, load1)</summary>
+
+| endpoint | c | arm | r1 | r2 | r3 |
+|---|---|---|---|---|---|
+| `/health` | 16 | uvloop | 422 (1.4) | 411 (5.5) | 425 (9.5) |
+| `/health` | 64 | uvloop | 442 (1.9) | 430 (6.1) | 459 (10.6) |
+| `/auth/me` | 16 | uvloop | 1,730 (3.0) | 1,641 (7.9) | 1,518 (6.7) |
+| `/auth/me` | 64 | uvloop | 1,736 (3.6) | 1,686 (6.6) | 1,572 (6.6) |
+| `/trade-sessions/` | 16 | uvloop | 509 (4.0) | 444 (5.2) | 430 (5.3) |
+| `/trade-sessions/` | 64 | uvloop | 486 (3.7) | 408 (6.1) | 416 (5.9) |
+| `/positions/pnl-stats` | 16 | uvloop | 1,116 (3.6) | 1,045 (7.1) | 1,077 (6.1) |
+| `/positions/pnl-stats` | 64 | uvloop | 1,079 (2.8) | 847 (5.9) | 1,053 (5.5) |
+| `/health` | 16 | rsloop | 432 (3.4) | 463 (4.0) | 434 (4.4) |
+| `/health` | 64 | rsloop | 411 (5.4) | 409 (5.2) | 397 (3.7) |
+| `/auth/me` | 16 | rsloop | 1,915 (6.6) | 1,301 (8.1) | 1,218 (7.8) |
+| `/auth/me` | 64 | rsloop | 1,310 (6.6) | 1,188 (6.5) | 1,018 (10.8) |
+| `/trade-sessions/` | 16 | rsloop | 451 (8.5) | 481 (5.5) | 402 (8.1) |
+| `/trade-sessions/` | 64 | rsloop | 447 (6.2) | 441 (4.6) | 415 (8.3) |
+| `/positions/pnl-stats` | 16 | rsloop | 915 (6.2) | 836 (5.4) | 630 (8.7) |
+| `/positions/pnl-stats` | 64 | rsloop | 1,016 (5.9) | 1,035 (4.9) | 699 (8.2) |
+| `/health` | 16 | fork | 418 (4.6) | 421 (3.9) | 475 (8.5) |
+| `/health` | 64 | fork | 443 (3.9) | 398 (2.9) | 459 (10.1) |
+| `/auth/me` | 16 | fork | 2,126 (4.1) | 1,405 (4.5) | 1,374 (12.8) |
+| `/auth/me` | 64 | fork | 1,563 (3.6) | 1,567 (5.0) | 1,417 (10.9) |
+| `/trade-sessions/` | 16 | fork | 497 (3.9) | 417 (5.6) | 428 (8.9) |
+| `/trade-sessions/` | 64 | fork | 476 (3.6) | 467 (5.7) | 399 (7.7) |
+| `/positions/pnl-stats` | 16 | fork | 1,023 (3.6) | 1,033 (5.6) | 788 (7.6) |
+| `/positions/pnl-stats` | 64 | fork | 888 (4.4) | 1,033 (6.1) | 751 (8.3) |
+| `/health` | 16 | asyncio | 421 (4.3) | 428 (4.7) | 402 (7.8) |
+| `/health` | 64 | asyncio | 441 (3.6) | 427 (3.9) | 439 (5.7) |
+| `/auth/me` | 16 | asyncio | 1,815 (3.6) | 1,493 (5.2) | 1,403 (6.0) |
+| `/auth/me` | 64 | asyncio | 1,633 (4.5) | 1,564 (6.7) | 1,627 (7.9) |
+| `/trade-sessions/` | 16 | asyncio | 513 (6.2) | 439 (7.0) | 433 (7.2) |
+| `/trade-sessions/` | 64 | asyncio | 451 (4.2) | 448 (7.6) | 351 (7.8) |
+| `/positions/pnl-stats` | 16 | asyncio | 1,016 (4.9) | 987 (6.1) | 739 (9.5) |
+| `/positions/pnl-stats` | 64 | asyncio | 1,165 (5.2) | 1,021 (6.4) | 845 (8.8) |
+
+</details>
+
+#### `5cf71aa` investor_api: median rps of 3 interleaved rounds (60 s each)
+
+| endpoint | c | uvloop | asyncio | rsloop 0.1.64 | **fork** | fork vs uvloop | fork vs 0.1.64 | uvloop round spread | CPU-ms/1k uvloop / 0.1.64 / fork | new PG sessions/1k uvloop / 0.1.64 / fork | load1 at rows (min–max) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `/health/` | 16 | 456 | 159 | 394 | **419** | -8.0% | +6.5% | 61.9% | 1,768 / 2,101 / 2,083 | 15.0 / 15.9 / 14.8 | 2.0–11.6 |
+| `/health/` | 64 | 49 | 48 | 49 | **48** | -0.5% | -0.2% | 4.2% | 1,828 / 2,030 / 1,946 | 92.6 / 92.3 / 92.5 | 1.3–9.4 |
+| `/auth/me` | 16 | 2,342 | 2,390 | 1,236 | **2,343** | +0.0% | +89.5% | 15.9% | 854 / 1,619 / 854 | 2.2 / 52.3 / 4.9 | 1.4–7.6 |
+| `/auth/me` | 64 | 2,316 | 2,305 | 2,477 | **2,402** | +3.7% | -3.1% | 8.6% | 864 / 808 / 833 | 1.9 / 2.7 / 2.4 | 2.4–7.4 |
+| `/notifications/unread-count` | 16 | 1,762 | 1,913 | 1,117 | **1,832** | +3.9% | +64.0% | 18.8% | 1,135 / 1,792 / 1,092 | 4.9 / 51.2 / 8.3 | 2.7–6.3 |
+| `/notifications/unread-count` | 64 | 1,864 | 1,874 | 1,930 | **1,917** | +2.8% | -0.7% | 2.2% | 1,073 / 1,037 / 1,044 | 2.4 / 4.4 / 2.8 | 2.5–5.2 |
+| `/reports/` | 16 | 1,451 | 1,567 | 1,031 | **1,461** | +0.7% | +41.8% | 7.7% | 1,378 / 1,941 / 1,369 | 9.2 / 45.9 / 10.2 | 2.6–4.2 |
+| `/reports/` | 64 | 1,502 | 1,520 | 1,582 | **1,553** | +3.4% | -1.8% | 30.5% | 1,332 / 1,266 / 1,289 | 2.9 / 3.1 / 3.5 | 2.8–4.2 |
+
+fork ≥ uvloop on 6 of 8 rows; geometric mean fork vs uvloop +0.7%, fork vs rsloop 0.1.64 +20.4%.
+
+<details><summary>investor_api: every row, every round (rps, load1)</summary>
+
+| endpoint | c | arm | r1 | r2 | r3 |
+|---|---|---|---|---|---|
+| `/health/` | 16 | uvloop | 457 (11.6) | 456 (2.6) | 282 (2.1) |
+| `/health/` | 64 | uvloop | 49 (9.4) | 47 (2.2) | 49 (1.6) |
+| `/auth/me` | 16 | uvloop | 2,034 (7.6) | 2,342 (1.6) | 2,357 (1.4) |
+| `/auth/me` | 64 | uvloop | 2,140 (7.4) | 2,316 (2.7) | 2,324 (2.4) |
+| `/notifications/unread-count` | 16 | uvloop | 1,762 (6.3) | 1,601 (2.7) | 1,903 (3.0) |
+| `/notifications/unread-count` | 64 | uvloop | 1,832 (5.2) | 1,864 (3.7) | 1,872 (2.5) |
+| `/reports/` | 16 | uvloop | 1,428 (3.8) | 1,538 (3.4) | 1,451 (2.6) |
+| `/reports/` | 64 | uvloop | 1,164 (3.4) | 1,502 (3.2) | 1,519 (3.2) |
+| `/health/` | 16 | rsloop | 394 (6.8) | 391 (2.4) | 404 (2.5) |
+| `/health/` | 64 | rsloop | 49 (4.5) | 49 (1.8) | 48 (1.9) |
+| `/auth/me` | 16 | rsloop | 1,321 (3.1) | 1,203 (1.5) | 1,236 (1.5) |
+| `/auth/me` | 64 | rsloop | 2,310 (4.0) | 2,483 (3.1) | 2,477 (2.9) |
+| `/notifications/unread-count` | 16 | rsloop | 1,355 (4.2) | 1,117 (3.2) | 1,114 (2.9) |
+| `/notifications/unread-count` | 64 | rsloop | 1,763 (3.8) | 1,935 (3.1) | 1,930 (3.6) |
+| `/reports/` | 16 | rsloop | 1,379 (4.2) | 1,023 (3.6) | 1,031 (3.5) |
+| `/reports/` | 64 | rsloop | 1,498 (3.7) | 1,597 (4.2) | 1,582 (3.6) |
+| `/health/` | 16 | fork | 419 (3.3) | 423 (2.9) | 414 (2.3) |
+| `/health/` | 64 | fork | 48 (2.3) | 48 (2.1) | 48 (1.8) |
+| `/auth/me` | 16 | fork | 2,226 (1.9) | 2,343 (1.8) | 2,406 (1.8) |
+| `/auth/me` | 64 | fork | 2,358 (3.2) | 2,402 (3.5) | 2,459 (2.7) |
+| `/notifications/unread-count` | 16 | fork | 1,633 (3.5) | 1,879 (3.4) | 1,832 (3.1) |
+| `/notifications/unread-count` | 64 | fork | 1,886 (3.8) | 1,917 (3.5) | 1,953 (3.2) |
+| `/reports/` | 16 | fork | 1,404 (3.5) | 1,461 (3.0) | 1,545 (3.3) |
+| `/reports/` | 64 | fork | 1,509 (3.2) | 1,553 (3.0) | 1,586 (3.3) |
+| `/health/` | 16 | asyncio | 129 (2.9) | 159 (2.0) | 347 (2.1) |
+| `/health/` | 64 | asyncio | 48 (3.1) | 48 (1.3) | 49 (1.7) |
+| `/auth/me` | 16 | asyncio | 1,996 (2.7) | 2,390 (1.7) | 2,416 (2.4) |
+| `/auth/me` | 64 | asyncio | 1,950 (3.2) | 2,305 (2.9) | 2,356 (3.1) |
+| `/notifications/unread-count` | 16 | asyncio | 1,832 (5.9) | 1,913 (3.9) | 1,923 (3.0) |
+| `/notifications/unread-count` | 64 | asyncio | 1,840 (5.0) | 1,874 (3.5) | 1,885 (3.2) |
+| `/reports/` | 16 | asyncio | 1,517 (3.9) | 1,567 (3.6) | 1,592 (3.3) |
+| `/reports/` | 64 | asyncio | 1,512 (3.2) | 1,520 (3.5) | 1,559 (2.8) |
+
+</details>
+
+</details>
 
 ## Remaining differences and notes
 
@@ -418,9 +685,14 @@ _The final 3-round run on `b15c357` is in progress; this section is filled from 
   appear in any profile here (`smol`/`blocking` threads < 4 µs/req).
 - **Opting back into the spin.** `RSLOOP_WAKE_SPIN_US=50` restores the old
   behaviour. It only pays off when the waking threads never hold the GIL.
-- **Upstream.** Nothing has been sent; contact needs the operator's yes. Both
-  commits are self-contained and would apply to upstream `master` as they
-  stand.
+- **Upstream.** Nothing has been sent; contact needs the operator's yes. The
+  three commits are self-contained and would apply to upstream `master` as
+  they stand.
+- **Behaviour change in opt 3.** Callbacks scheduled during a turn now run in
+  the next turn, after an I/O poll, which is asyncio's and uvloop's order.
+  rsloop's own suite (527 tests) and the stress suite pass. Code that relied
+  on rsloop running chains to quiescence before polling I/O would see I/O
+  interleaved earlier, as it would on asyncio.
 
 ## Reproducing
 
