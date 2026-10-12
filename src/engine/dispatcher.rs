@@ -27,7 +27,7 @@ use super::commands::ConnectCompletion;
 use super::{
     commands::{
         AcceptedConnection, FutureCompletion, LoopCommand, LoopFutureCommand, LoopIoCommand,
-        LoopRunCommand, LoopSignalCommand, LoopTransportCommand, ReadyItem,
+        LoopRunCommand, LoopSignalCommand, LoopTransportCommand, PendingReady, ReadyItem,
     },
     loop_core::LoopCore,
 };
@@ -54,7 +54,7 @@ struct RuntimeDispatcher {
 
 /// Queue shared with the Python loop thread while `run_forever` is active.
 struct ActiveRun {
-    pending_ready: Arc<std::sync::Mutex<VecDeque<ReadyItem>>>,
+    pending_ready: Arc<std::sync::Mutex<PendingReady>>,
 }
 
 #[cfg(unix)]
@@ -245,9 +245,12 @@ impl RuntimeDispatcher {
                         stream,
                     })));
             }
-            LoopCommand::Run(LoopRunCommand::EnterRun { pending_ready }) => {
+            LoopCommand::Run(LoopRunCommand::EnterRun {
+                pending_ready,
+                local_mark,
+            }) => {
                 self.active_run = Some(ActiveRun { pending_ready });
-                self.dispatch_ready_batch();
+                self.forward_ready_batch(local_mark);
             }
             LoopCommand::Run(LoopRunCommand::FinishRun { done_tx }) => {
                 self.finish_run();
@@ -486,6 +489,15 @@ impl RuntimeDispatcher {
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "RuntimeDispatcher"))]
     fn dispatch_ready_batch(&mut self) {
+        // Commands received mid-run are merged behind every loop-thread
+        // enqueue so far; their producers called in before forwarding, so this
+        // only errs towards running them later, as a busy queue would.
+        self.forward_ready_batch(self.core.local_enqueue_mark());
+    }
+
+    /// Moves received commands into the active run, scheduled after
+    /// `local_mark` loop-thread enqueues.
+    fn forward_ready_batch(&mut self, local_mark: u64) {
         let Some(active_run) = self.active_run.as_ref() else {
             return;
         };
@@ -498,7 +510,7 @@ impl RuntimeDispatcher {
             .pending_ready
             .lock()
             .expect("poisoned pending ready queue");
-        pending.extend(self.ready_batch.drain(..));
+        pending.extend(self.ready_batch.drain(..), local_mark);
         drop(pending);
         self.core
             .channel_handles_forwarded(std::mem::take(&mut self.channel_handles));
@@ -517,8 +529,9 @@ impl RuntimeDispatcher {
         // direct off-thread handles) than commands received since the last
         // dispatch, so it goes first.
         if let Ok(mut pending) = active_run.pending_ready.lock() {
-            pending.extend(self.ready_batch.drain(..));
-            std::mem::swap(&mut self.ready_batch, &mut *pending);
+            let mut queued = pending.take_items();
+            queued.append(&mut self.ready_batch);
+            self.ready_batch = queued;
         }
 
         {
