@@ -1,0 +1,440 @@
+# Why rsloop 0.1.64 is slower than uvloop on copytrade's investor_api, and the fix
+
+Fork branch `pipeline/rsloop-66130a3e`, based on upstream v0.1.64 (`c9aa601`).
+Task: copytrade eff35519 (issues #1120/#1186). All numbers are from the
+operator's 3-CPU, 31 GiB machine, shared with other agents; every number
+below carries the 1-minute load average (`load1`) measured with it.
+
+## Summary
+
+- **Root cause.** rsloop's loop thread spun for up to 50 µs, with the GIL
+  released, waiting for a cross-thread wake before parking
+  (`src/engine/loop_core.rs:128-143` and `:1058-1090` at `c9aa601`).
+  - Behind Granian, those wakes come from Python threads
+    (`loop.call_soon_threadsafe` in `granian/_futures.py`) that still hold the
+    GIL when the flag flips. The spinning loop thread therefore queued for the
+    GIL behind them, paying up to the 5 ms switch interval per reattach.
+  - As a result, request starts and completions reached the loop in bursts.
+    investor_api's SQLAlchemy pool (4 + 2 overflow per Granian worker, 8
+    requests per worker at c16) then kept discarding returned connections into
+    a full idle queue and opening new ones.
+  - Measured on the real service at c16: **33–53 new Postgres sessions per 1k
+    requests on rsloop vs 3–4 on uvloop**. Each new session costs a SCRAM
+    login (PBKDF2), asyncpg setup and a getaddrinfo thread. That was 6–7% of
+    all samples in `libcrypto` alone, and in total the whole ~450–650 µs CPU
+    per request by which rsloop trailed. The container runs at its 2-CPU
+    quota, so CPU per request is throughput.
+- **Why the gap had this shape.** At c64 investor_api's pool is permanently
+  saturated (waiters always queued), so a check-in rarely finds a full queue:
+  rsloop was level there. admin_api's pool (8 + 4) is larger than its
+  per-worker c16 concurrency, so the burst mechanism above barely touched it.
+- **Second, smaller cause: turns ran to quiescence.** It surfaced on
+  admin_api once the spin was gone. Each `run_forever` turn took in the
+  callbacks it scheduled itself (every 64 items, up to 1024) and polled the
+  reactor only when nothing was left (`src/engine/loop_core.rs:838-890` at
+  `c9aa601`).
+  - Under saturation, DB responses piled up between polls and completed in
+    one burst. More connections came back than the pool's idle queue holds
+    (8) before any woken waiter ran.
+  - Measured on admin_api `/auth/me` at c64 on `5cf71aa`: about 690
+    full-queue check-ins in 20 s and 20 new sessions per 1k requests, vs
+    0.1–3.7 sessions per 1k on uvloop (at most a few full-queue check-ins).
+- **The cross-thread hop** through the coordination thread on every
+  `call_soon_threadsafe` is real but small: about 4 µs of CPU per request on
+  the `rsloop` thread, and 11.4 → 7.8 µs per cross-thread callback in a
+  microbenchmark.
+- **Fixes (3 commits).**
+  1. `5d2ce85` enqueues off-thread handles directly into the active run.
+  2. `5cf71aa` parks instead of spinning by default (`RSLOOP_WAKE_SPIN_US`
+     now defaults to 0 and remains an opt-in).
+  3. `b15c357` runs one callback generation per turn, as asyncio's
+     `_run_once` does, and polls the reactor with the GIL released between
+     turns, as uvloop does.
+- **Result.** See [Final table](#final-table): fork vs rsloop 0.1.64 vs
+  uvloop vs asyncio, both APIs, 3 interleaved rounds, with load per row.
+
+## Setup
+
+- **Harness.** The #1120 harness method (`~/.cache/ct1120-064/bench/bench.py`):
+  - Granian 2.7.5 with 2 workers, CPython 3.14.5, image `--cpus 2`, oha in its
+    own container (`--cpus 2`).
+  - 15 s warm-up, then 60 s at c16 and at c64 per endpoint.
+  - Arms interleaved and rotated per round.
+  - Moved to an isolated compose project `rsperf` (own container, network and
+    volume names; no host ports) at `~/.cache/rsloop-perf/`, with its own
+    Postgres/Redis/NATS seeded by the services' dev entrypoints.
+- **Arms.** uvloop 0.22.1, rsloop 0.1.64 (the image's pin), asyncio, and
+  **fork**.
+  - The fork arm uses the same image and code, with only `PYTHONPATH` putting
+    the fork's wheel first.
+  - The fork wheel is built with maturin (`--release --locked`, the
+    repository's own release profile) on the image's base (Debian trixie,
+    `python:3.14.5-slim`).
+  - For the final table it is installed into `rsperf-<api>:fork` by the
+    compose project (`~/.cache/rsloop-perf/fork-image/Dockerfile`), at
+    `/opt/rsloop-fork`.
+  - A local build of unmodified `c9aa601` behaves like the PyPI 0.1.64 wheel
+    (cross-thread ping-pong 8.9 vs 7.9 µs/op wall time and 15.8 vs 13.6 µs
+    CPU, one smoke run, load 5.2).
+- **Reactor.** In Docker the loop runs on **epoll**: the default seccomp
+  profile refuses `io_uring_setup`, as in production. Microbenchmarks run in
+  the same `python:3.14.5-slim` image under `--cpus 2`. The defect repros
+  also run on the host, which uses **io_uring**.
+- **New-session counter.** The harness now also reports new Postgres sessions
+  per 1k requests (`pg_stat_database.sessions` delta), the counter that
+  exposed the root cause.
+
+## 1. Baseline: the 0.1.64 lane's numbers (`~/.cache/ct1120-064/run/bench`)
+
+Median rps over 3 rounds:
+
+| api | endpoint | c | uvloop | rsloop 0.1.64 | Δ | CPU-ms/1k uvloop / rsloop | load1 |
+|---|---|---|---|---|---|---|---|
+| investor_api | `/auth/me` | 16 | 2,057 | 1,150 | −44.1% | 972 / 1,740 | 2.2–6.2 |
+| investor_api | `/auth/me` | 64 | 1,965 | 2,150 | +9.4% | 1,018 / 931 | 3.1–6.2 |
+| investor_api | `/notifications/unread-count` | 16 | 1,543 | 1,093 | −29.1% | 1,295 / 1,830 | 3.5–6.1 |
+| investor_api | `/notifications/unread-count` | 64 | 1,568 | 1,626 | +3.7% | 1,276 / 1,231 | 4.0–6.0 |
+| investor_api | `/reports/` | 16 | 1,281 | 1,022 | −20.2% | 1,559 / 1,957 | 4.2–5.7 |
+| investor_api | `/reports/` | 64 | 1,289 | 1,369 | +6.2% | 1,551 / 1,462 | 3.9–5.8 |
+| admin_api | `/auth/me` | 16 | 1,689 | 1,888 | +11.7% | 1,182 / 1,051 | 3.3–5.4 |
+| admin_api | `/positions/pnl-stats` | 16 | 1,003 | 881 | −12.2% | 1,984 / 2,256 | 3.2–5.5 |
+| admin_api | `/trade-sessions/` | 16 | 475 | 450 | −5.3% | 4,196 / 4,416 | 3.5–5.2 |
+
+At c16, rps × CPU-ms per request ≈ 2,000 ms/s for **both** loops: the
+container is pinned at its 2-CPU quota. The throughput gap is therefore
+exactly a CPU-per-request gap (investor `/notifications/unread-count`:
+1,830 vs 1,295 ms per 1k requests, about 535 µs per request). The question
+became where rsloop spends the extra CPU, and why only at c16.
+
+## 2. Profiles of investor_api at c16 (`/notifications/unread-count`)
+
+Tool: `~/.cache/rsloop-perf/bench/profile.py`. Raw outputs are under
+`~/.cache/rsloop-perf/profiles/`.
+
+- It starts the arm through the compose project and holds oha at c16.
+- It reads per-thread CPU and context switches from `/proc` over a 20 s window.
+- It then runs `strace -c -f` (10 s), `perf record -g` (15 s, 997 Hz) and
+  py-spy from a privileged sidecar that joins the container's PID namespace.
+
+### 2a. Where the CPU goes, per thread (20 s window, no tracer attached)
+
+| arm | rps | cgroup CPU µs/req | loop threads (`python`) µs/req | `tokio-rt-worker` (Granian) µs/req | `rsloop` coordination thread µs/req | csw/req on `python` threads | new PG sessions /1k req | load1 |
+|---|---|---|---|---|---|---|---|---|
+| uvloop | 1,374 | 1,454 | 1,415 | 37 | — | 4.10 | — | 5.7 |
+| rsloop 0.1.64 | 1,056 | 1,894 | 1,839 | 36 | 4.3 | 1.93 | — | 7.1 |
+| fork `5d2ce85` (opt 1) | 1,087 | 1,839 | 1,789 | 35 | 0.0 | 2.00 | — | 7.6 |
+| uvloop (rerun) | 1,645 | 1,215 | 1,186 | 35 | — | 4.02 | **4.2** | 6.8 |
+| rsloop 0.1.64 (rerun) | 1,097 | 1,823 | 1,780 | 35 | 3.2 | 1.91 | **40.0** | 6.1 |
+| uvloop (rerun) | 1,582 | 1,264 | 1,234 | 38 | — | 4.11 | **4.3** | 6.4 |
+| rsloop 0.1.64 (rerun) | 922 | 2,097 | 2,051 | 42 | 3.8 | 2.94 | **33.6** | 8.7 |
+
+- **The extra CPU is on the Python loop threads themselves.** The
+  coordination thread (`rsloop`), rsloop's helper threads (`smol`,
+  `blocking`) and Granian's tokio threads together account for less than
+  10 µs/req of the difference.
+- **rsloop context-switches less than uvloop** (1.9 vs 4.1 per request). The
+  busy-wait replaced sleeping, so the waste does not show up as scheduler
+  activity.
+
+### 2b. perf: CPU by DSO (all threads of both workers, 15 s, ~33k samples each)
+
+| DSO | uvloop | rsloop 0.1.64 |
+|---|---|---|
+| libpython3.14 | 65.4% | 63.6% |
+| kernel | 17.0% | 11.8% |
+| **libcrypto.so.3** | — (below 0.1%) | **6.4%** |
+| asyncpg `protocol` | 1.7% | **4.7%** |
+| libc | 2.4% | 3.0% |
+| `_granian` | 5.4% | 2.6% |
+| `_hashlib` | — | 0.6% |
+| loop extension (`loop` / `_loop`) | 2.0% | 1.6% |
+
+The top rsloop symbols include asyncpg's
+`SCRAMAuthentication._bytes_xor` generator and `OPENSSL_cleanse`. In
+`perf script`, **4,744 rsloop samples sit inside SCRAM authentication,
+against 18 for uvloop**.
+
+Postgres authenticates only when a connection is opened. Under rsloop the
+service therefore kept opening database connections, which section 2a's
+counter confirms: about 35–40 vs 4 new sessions per 1k requests.
+
+### 2c. strace -c (10 s, both workers)
+
+| syscall | uvloop | rsloop 0.1.64 |
+|---|---|---|
+| futex | 87,089 | 59,249 |
+| epoll_wait / epoll_pwait | 30,865 / 49,822 | 44,151 / — |
+| write / sendto | 114,387 / — | 19,226 / 58,899 |
+| close | 6 | **1,378** |
+| epoll_ctl | 12 | **1,652** |
+| ioctl | — | **1,923** |
+| newfstatat | 18 | **2,475** |
+| threads created during the window | 0 | **275** |
+
+The `close`, `epoll_ctl`, `ioctl` and `newfstatat` counts, and the new
+threads (getaddrinfo/connect helpers), are the footprint of the reconnects.
+uvloop's 114k `write` calls include its `uv_async` eventfd wakes for
+`call_soon_threadsafe`; rsloop sends socket data with `sendto`. Neither
+difference matters at this scale.
+
+py-spy `--native` could not attach from the sidecar (empty output). The perf
+call graphs above cover the same question.
+
+## 3. Isolating the mechanism
+
+Tool: `perf/bench/pool_churn.py` (also at `~/.cache/rsloop-perf/bench/`). It
+reproduces investor_api's database shape on one loop, without Granian or the
+application:
+
+- `create_async_engine(pool_size=4, max_overflow=2, pool_pre_ping=True,
+  pool_timeout=10)` on asyncpg against the rsperf Postgres;
+- 8 driver threads, each posting a request through
+  `loop.call_soon_threadsafe` (as Granian's `_CBScheduler` does) and blocking
+  on a reply queue (closed loop, like oha c16 across 2 workers);
+- each request runs 2 queries in one session.
+
+It reports requests/s, process CPU per request, pool connects per 1k, and
+three latencies:
+
+- post → task start (the loop picking up a cross-thread request);
+- service (checkout + queries + checkin);
+- reply → driver resume.
+
+Docker epoll, `--cpus 1` unless noted. Medians of 3 runs:
+
+| arm | req/s | CPU µs/req | connects /1k | post→start µs | service µs | reply→resume µs | load1 |
+|---|---|---|---|---|---|---|---|
+| uvloop | 2,166 | 434 | 0.1 | 222 | 3,212 | 225 | 10.6–12.2 |
+| rsloop 0.1.64 | 598 | 1,661 | 61.3 | 1,688 | 10,259 | 1,448 | 10.4–14.6 |
+| fork opt 1 (direct enqueue) | 641 | 1,534 | 55.0 | 1,724 | 9,391 | 1,495 | 10.1–13.6 |
+| fork opt 2 (no spin) | **2,593** | **377** | **0.2** | **39** | 2,996 | **52** | 10.3–12.5 |
+
+The pool trace (`CHURN_TRACE=1`) shows what goes wrong under 0.1.64:
+
+- Connections come back while the idle queue already holds 3–4 of them with
+  no waiter: only 2–3 of the 8 requests are inside the database section.
+  - At least 343 check-ins found the queue full and were discarded in 6 s.
+  - At least 265 connections were created into an empty queue (the
+    trace's top rows).
+- The rest of the requests sit between the driver and the loop: 1.4–1.7 ms
+  post→start, against 0.15–0.22 ms on uvloop.
+- uvloop's trace has 2 full-queue check-ins, and its only creations are
+  the 6 that first fill the pool.
+
+Hypotheses tested:
+
+| # | Hypothesis | Test | Verdict |
+|---|---|---|---|
+| H1 | Every off-thread `call_soon_threadsafe` takes two wakeups (channel → coordination thread → run queue → loop thread), `src/engine/loop_core.rs:479-497` and `src/engine/dispatcher.rs:206` at `c9aa601`. | microbench `xthread_pingpong`; per-thread CPU | **Confirmed, minor.** 11.4 → 7.8 µs CPU per cross-thread callback; `rsloop` thread 4.3 → 0 µs/req. Does not touch the churn (61 → 55 /1k). Fixed in opt 1. |
+| H2 | The 50 µs loop-thread spin before parking (`loop_core.rs:128-143`, `:1058-1090`) hurts when wakes come from GIL-holding Python threads. | `RSLOOP_WAKE_SPIN_US=0` on the same build | **Confirmed, root cause.** Churn 55 → 0.2 /1k, post→start 1.7 ms → 39 µs, 4× req/s. Fixed in opt 2. |
+| H2a | The spin starves the reactor: while consecutive spins keep catching wakes (up to `MAX_CONSECUTIVE_SPINS` = 64) the loop never polls its sockets. | Variant polling the reactor (`poll_once`) after every caught spin | **Refuted.** Still 55–82 connects /1k. |
+| H2b | The spin burns the container's CFS quota and gets the cgroup throttled. | Same repro at `--cpus 2` and `--cpus 3` | **Refuted.** Churn identical (53–56 /1k) without a binding quota. |
+| H2c | GIL convoy: the spinner sees the wake while its producer still holds the GIL and queues behind the driver threads passing the GIL among themselves (`take_gil` waits up to the 5 ms switch interval before forcing a drop). A parked loop wakes after the producer released the GIL and drains everything queued. | Latency split above; no-spin variant | **Consistent with every measurement.** Post→start and resume latencies drop 30–40×, and no other loop change matters. |
+| H3 | Timer heap cost (SQLAlchemy/asyncpg `asyncio.timeout` per query). | microbench `timers_cancel` | **Refuted.** rsloop 1.48 µs/op vs uvloop 2.35. |
+| H4 | Ready-queue / `call_soon` cost, GIL attach per callback. | microbench `soon_chain` | **Refuted.** rsloop 0.17 µs/op vs uvloop 0.45 (the drain holds the GIL across a batch). |
+| H5 | Transport read/write path (loop-thread reader task, small-write staging for client protocols: `src/transport/stream/builder.rs:154`, `core_write.rs:416`). | `tcp_pingpong`, `tcp_pingpong_c8` | **Not material here.** With 8 connections the fork is level or ahead (8.2 vs 9.2 µs CPU/rt). A single strictly serial connection is still slower: 10.5 vs 8.0 µs CPU per round trip (0.1.64: 15.2). Left as is (see Remaining differences). |
+| H6 | io_uring vs epoll. | Docker runs epoll (seccomp), as production does | **Not the cause.** The harness gap is on epoll. |
+| H8 | Each turn runs to quiescence before the reactor is polled again (`loop_core.rs:838-890` at `c9aa601`), so I/O completions arrive in bursts larger than a pool's idle queue. | Pool trace inside admin_api (section 3a); opt 3 | **Confirmed, second cause.** Surfaced once the spin was gone: about 690 full-queue check-ins in 20 s on `5cf71aa` vs at most a few on uvloop. Fixed in opt 3. |
+| H7 | Future/Task bridging with Granian's `CallbackScheduler`. | Granian threads ≈ 35–42 µs/req on every arm | **Refuted.** Same cost on every loop. |
+
+### 3a. The second mechanism: completions in bursts (admin_api)
+
+The first full 3-round run on `5cf71aa` (table under
+[Final table](#final-table)) left admin_api at a geometric mean of −4.6% vs
+uvloop. Its new-session counter was still elevated (e.g. `/auth/me` c64:
+uvloop 2.6, `5cf71aa` 14.1, 0.1.64 37.8 per 1k).
+
+Three things ruled out the obvious sources:
+- admin_api writes every INFO+ log record through a fresh `asyncpg.connect`
+  (`infrastructure/observability/persistent_logs.py:97`, `:160`). Both arms
+  persisted the same handful of lines during the window, so logging is not
+  the difference.
+- c16 puts at most 8 requests on a worker, against 8 pooled + 4 overflow
+  connections.
+- The standalone repro at admin's settings (8 + 4, 32 drivers) does not
+  churn on the fork: 0.6 vs 0 per 1k, and it is faster than uvloop there.
+
+So the pool was traced inside the real service. An opt-in `sitecustomize`
+(`~/.cache/rsloop-perf/bench/sitecustomize.py`, `RSPERF_TRACE_POOL=1`) counts
+every check-in and creation by (idle queue size, waiting getters, overflow)
+in each Granian worker. admin_api `/auth/me` c64, 20 s windows, load 2.6–3.7:
+
+| arm | rps | new PG sessions /1k | check-ins | check-ins into a full queue (8/8) | check-ins at 7/8 | pool `close` events |
+|---|---|---|---|---|---|---|
+| uvloop | 1,756 | 0.1 | 95,800 (top 25 states) | ≤ 3 (0.1 sessions/1k; not among the 25 most frequent states) | not among the top 25 | — |
+| fork `5cf71aa` | 1,601 | 20.2 | 90,070 | ~690, with 5–20 getters waiting | ~2,000 | 698 |
+
+On the fork, connections came back while their idle queue already held 7–8
+and up to 20 requests were waiting: more check-ins happened in one burst than
+woken waiters could run in between. On uvloop the 25 most frequent states all
+have 0–2 idle connections.
+
+The burst came from the drain: a turn took in every callback it scheduled
+(refill every 64 items, up to 1024) and polled the reactor only when nothing
+was left. A whole chain of response → request step → check-in → next
+response therefore ran inside one turn. asyncio's `_run_once` runs only what
+was ready when the iteration started and polls I/O again before anything
+newer.
+
+## 4. Optimisations (one per commit, each measured)
+
+### opt 1: `5d2ce85` off-thread `call_soon_threadsafe` joins the active run directly
+
+`LoopCore::schedule_ready_handle` (`src/engine/loop_core.rs:492`):
+
+- An off-thread handle now goes straight into the active run's pending queue
+  and wakes the loop once, while no earlier handle is still on the command
+  channel.
+- A counter of handles in flight on the channel (`channel_handles`, released
+  by the dispatcher in `dispatch_ready_batch`, `src/engine/dispatcher.rs:488`)
+  preserves each producer's FIFO order across run start and run end.
+- `finish_run` (`dispatcher.rs:511`) now puts the run's queue (older work)
+  ahead of commands received since the last dispatch.
+- New test:
+  `tests/test_fast_callbacks.py::test_threadsafe_producer_order_survives_run_restarts`.
+
+| measure | rsloop (c9aa601 build) | opt 1 | uvloop | load1 |
+|---|---|---|---|---|
+| `xthread_pingpong` CPU µs/op (wall) | 11.4 (6.3) | 7.8 (5.7) | 5.9 (5.0) | 3.9 |
+| `xthread_task_pingpong` CPU µs/op (wall) | 10.4 (6.2) | 6.9 (4.8) | 6.9 (6.9) | 3.9–4.2 |
+| `granian_like` CPU µs/req | 56.8 | 50.1 | 48.3 | 4.6 |
+| harness-shaped c16 window (profile.py, `/notifications/unread-count`) rps / CPU µs/req | 1,056 / 1,894 | 1,087 / 1,839 | 1,374 / 1,454 | 5.7–7.6 |
+
+### opt 2: `5cf71aa` park instead of spinning by default
+
+`wake_spin_window` (`src/engine/loop_core.rs:141`) now defaults to 0. The
+spin code stays behind `RSLOOP_WAKE_SPIN_US`, documented in
+`docs/configuration.md`.
+
+Microbenchmarks (Docker epoll, `--cpus 2`, medians of 3, load1 9.9–12.4):
+
+| bench | rsloop (c9aa601) | opt 2 | uvloop |
+|---|---|---|---|
+| `granian_like` CPU µs/req (wall) | 54.6 (82.2) | **41.1 (77.9)** | 50.0 (81.1) |
+| `xthread_pingpong` CPU µs/op (wall) | 14.1 (8.3) | **6.5 (5.3)** | 7.6 (6.3) |
+| `xthread_task_pingpong` CPU µs/op | 13.3 | 11.9 | 11.5 |
+| `xthread_burst` CPU µs/op | 0.62 | 0.69 | 0.48 |
+| `tcp_pingpong` CPU µs/rt | 15.2 | 10.5 | 8.0 |
+| `tcp_pingpong_c8` CPU µs/rt | 8.4 | 8.2 | 9.2 |
+| `soon_chain` µs/op | 0.17 | 0.17 | 0.45 |
+| `timers_cancel` µs/op | 1.48 | 1.48 | 2.35 |
+| `pool_churn` req/s, connects /1k | 598, 61.3 | **2,593, 0.2** | 2,166, 0.1 |
+
+Harness, quick form (investor_api, c16, 30 s, 2 rounds, rotated):
+
+| endpoint | round | uvloop | rsloop 0.1.64 | fork opt 2 |
+|---|---|---|---|---|
+| `/auth/me` | 1 (load 4.9–10.8) | 1,567 | 1,846 | 2,358 |
+| `/auth/me` | 2 (load 2.7–3.0) | 2,315 | 1,401 (42.5 sessions/1k) | **2,400** (3.8/1k) |
+| `/notifications/unread-count` | 1 (load 4.4–17.6) | 1,347 | 1,680 | 1,839 |
+| `/notifications/unread-count` | 2 (load 3.0–3.6) | 1,848 | 1,101 (52.7/1k) | **1,898** (4.0/1k) |
+| `/reports/` | 1 (load 3.6–13.7) | 917 | 1,242 | 1,512 |
+| `/reports/` | 2 (load 3.2–3.7) | 1,378 | 1,240 (26.9/1k) | **1,553** (4.0/1k) |
+
+### opt 3: `b15c357` one callback generation per turn; poll I/O with the GIL released
+
+`run_forever` (`src/engine/loop_core.rs:839-878`):
+- A turn now runs the callbacks queued when it started. Newer ones wait for
+  the next turn, after a non-blocking reactor poll.
+- That per-turn poll (`loop_core.rs:1043-1052`) runs under `py.detach`, as
+  uvloop polls without the GIL.
+  - A first version kept the GIL across the poll. Back-to-back turns then
+    held it for the whole switch interval while `call_soon_threadsafe`
+    producers waited, and the investor-shaped pool repro fell to 851 req/s at
+    61 connects per 1k (load 2.1–2.6).
+- A queued `stop()` (`stop_requested`) keeps the turn going until its Stop
+  item runs, so stop still takes effect in the turn that requested it
+  (`tests/test_local_timers.py::test_timer_scheduled_by_stopping_callback_survives_next_run`).
+- New test: `tests/test_local_sockets.py::test_tcp_data_is_delivered_between_call_soon_generations`.
+  A self-rescheduling `call_soon` chain delayed a readable TCP protocol by
+  513 callbacks on `5cf71aa` and by 1 after; the test fails on `5cf71aa` and
+  passes now.
+
+Harness-shaped windows (`profile.py`, 20 s at steady oha load), two runs per
+arm, interleaved:
+
+| endpoint | c | uvloop rps (sessions/1k) | `5cf71aa` rps (sessions/1k) | `b15c357` rps (sessions/1k) | load1 |
+|---|---|---|---|---|---|
+| admin_api `/auth/me` | 64 | 1,746 / 1,748 (3.7 / 3.7) | 1,618 / 1,587 (19.9 / 20.1) | **1,936 / 1,892** (3.0 / 1.3) | 2.0–3.8 |
+| investor_api `/notifications/unread-count` | 16 | 1,852 / 1,843 (5.0 / 1.4) | — | **1,918 / 1,947** (3.8 / 3.5) | 3.1–3.6 |
+
+Microbenchmarks (Docker epoll, `--cpus 2`, medians of 3, load1 2.0–2.9) show
+what the extra turns cost:
+
+| bench | `5cf71aa` | `b15c357` | uvloop |
+|---|---|---|---|
+| `granian_like` CPU µs/req | 36.7 | 38.9 | 50.1 |
+| `xthread_pingpong` CPU µs/op | 5.6 | 5.4 | 5.6 |
+| `xthread_task_pingpong` CPU µs/op | 6.1 | 6.6 | 7.9 |
+| `tcp_pingpong` CPU µs/rt | 7.4 | 8.3 | 7.6 |
+| `tcp_pingpong_c8` CPU µs/rt | 7.9 | 8.0 | 7.5 |
+| `soon_chain` µs/op | 0.17 | 0.42 | 0.41 |
+| `timers_cancel` µs/op | 1.38 | 1.73 | 2.31 |
+| `pool_churn` (4 + 2, 8 drivers) req/s, connects /1k | 2,418 / 3,030; 8.5 / 2.7 | 3,274 / 3,327; 0.5 / 0.2 | 3,310 / 3,200; 0.0 / 0.1 |
+
+`soon_chain` is the deliberate cost: a self-rescheduling callback is now one
+turn per step, as in asyncio and uvloop.
+
+## 5. Correctness
+
+| check | where | result |
+|---|---|---|
+| `cargo test` (`scripts/run_rust_tests.py`, as `just test-rust`) | host | 352 passed after each commit. Needs a short `TMPDIR`: this session's default is too long for Unix-socket test paths (`SUN_LEN`). |
+| Python suite (`scripts/run_python_tests.py -m "not tooling and not stress and not slow_network"`, as `just test-fast`) | host, io_uring | opt 1: 525 passed. opt 2: 526 (+ the producer-order test). opt 3: 527 (+ the generation test). 141 skipped each time. |
+| Stress suite (`--stress-iterations -m stress`, as `just test-stress`) | host | opt 3: 5 passed, 3 skipped |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` (as `just clippy`), `cargo fmt --check`, ruff, pyright on the changed tests | host | clean at `b15c357` |
+| #115 greenlet lost wakeup / SIGSEGV (`issue1_repro.py`, every depth) | host io_uring (5 runs/depth) and Docker epoll (10 runs/depth, 110 runs) | 0 stuck, 0 SIGSEGV, 0 nonzero exits |
+| #116 protocol leak (`issue2_repro.py`) and stdlib StreamReaderProtocol churn | host and Docker | 0 protocols alive, +0 B per connection |
+| asyncpg connect/close churn | Docker | 0 protocols alive |
+| #118 cancelled TimerHandle retention (`repro.py`, `asyncpg_repro.py`) | host and Docker | 0/20000 alive in A/B/C; 0 statement caches or protocols alive |
+
+Ran on `5cf71aa` and again on `b15c357`, with identical results. Script:
+`~/.cache/rsloop-perf/defects-fork.sh <site>`, the #1186 commands pointed at
+the fork build. Results: `~/.cache/rsloop-perf/run/defects-opt2/` and
+`run/defects-head-b15c357/`.
+
+## Final table
+
+_The final 3-round run on `b15c357` is in progress; this section is filled from it._
+
+## Remaining differences and notes
+
+- **Single serial TCP connection.** On a strict one-connection ping-pong the
+  fork costs about 0.7 µs more CPU per round trip than uvloop (8.3 vs 7.6).
+  With 8 connections it is 8.0 vs 7.5. That difference sits in the
+  loop-thread reader task and turn bookkeeping. It is not pursued here: a
+  structural change would be needed (e.g. dispatching `data_received`
+  straight from the reactor callback, as libuv does), and it does not show on
+  the services.
+- **uvloop churns too.** It opens 3–9 new sessions per 1k on investor_api at
+  c16. The 4 + 2 pool per worker is below the 8 requests per worker that c16
+  puts on it.
+  - Raising `POOL_SIZE` would help every loop, but it is part of the
+    deployment-wide connection budget in `backend/services/database/AGENTS.md`.
+  - That is a copytrade decision, not part of this fork.
+- **`RSLOOP_READER_SPIN_US` is unchanged** (default 30 µs). It spins in
+  GIL-free blocking reader workers used by rsloop's native streams, which the
+  services do not use (they keep the stdlib `open_connection`). It did not
+  appear in any profile here (`smol`/`blocking` threads < 4 µs/req).
+- **Opting back into the spin.** `RSLOOP_WAKE_SPIN_US=50` restores the old
+  behaviour. It only pays off when the waking threads never hold the GIL.
+- **Upstream.** Nothing has been sent; contact needs the operator's yes. Both
+  commits are self-contained and would apply to upstream `master` as they
+  stand.
+
+## Reproducing
+
+All under `~/.cache/rsloop-perf/`:
+
+| path | what |
+|---|---|
+| `builder/` | wheel builder image (`python:3.14.5-slim` + nightly-2026-09-25 + maturin 1.15.0); `build-wheel.sh <src> <out>` |
+| `bench/site.sh` | unpacks a wheel into a `PYTHONPATH` dir under `sites/` |
+| `override.yml`, `bin-dc.sh`, `fork-image/` | the isolated `rsperf` compose project and the fork image build |
+| `bench/harness.py` | the #1120 harness for `rsperf`. Arms `uvloop`, `rsloop`, `fork`, `fork:<site>`, `<arm>@nospin`. `harness.py api <api> [rounds]` |
+| `bench/final.sh`, `bench/compare_final.py` | the final run and its table |
+| `bench/profile.py` | per-thread CPU, strace, perf and py-spy for one arm under oha |
+| `bench/run_micro.sh`, `bench/micro.py`, `bench/churn.sh`, `bench/pool_churn.py` | microbenchmarks and the pool-churn repro; `micro.py` and `pool_churn.py` are copied into `perf/bench/` |
+| `defects-fork.sh` | #115/#116/#118 re-checks for a fork build |
+| `bench/sitecustomize.py` | opt-in (`RSPERF_TRACE_POOL=1`) SQLAlchemy pool trace inside the service workers (arm variant `@trace`) |
+| `profiles/`, `run/` | profile summaries, logs and jsonl results. Raw `perf.data` and `perf.script` were deleted afterwards to save disk (the box was at 88%); the numbers quoted above came from them. |
