@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, Ordering, fence},
     },
     task::Waker,
 };
@@ -86,6 +86,9 @@ impl TaskWake {
             }
             remote.queue.push(wake.clone());
         }
+        // Pairs with the fence after `block_on` publishes `waiting`: either
+        // the park sees this task in the queue, or this sees `waiting`.
+        fence(Ordering::SeqCst);
         if remote.waiting.load(Ordering::Acquire)
             && !remote.interrupt_pending.swap(true, Ordering::AcqRel)
         {
