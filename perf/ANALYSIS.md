@@ -14,12 +14,14 @@ Every number below carries the 1-minute load average (`load1`) measured with
 it. The benchmarks of fixes 4 and 5 also carry the CPU used outside the
 benchmark's containers (see [What fixes 4 and 5 cost](#what-fixes-4-and-5-cost)).
 
-**Status of the evidence.** The full-service table
-([Latest full run](#latest-full-run-b15c357)) was measured at `b15c357`
-(opt 3) and predates fixes 4 and 5. The final quiet-gated rounds that would
-have re-measured the services on `6101e34` were **not run** (operator
-decision, 2026-10-12), and that table's admin_api round 2 is contaminated by
-host load. See [Status and what is unverified](#status-and-what-is-unverified).
+**Status of the evidence.** The acceptance table is the
+[Final run](#final-run-c2de600-fork-vs-uvloop): quiet-gated, fork vs uvloop
+only, 3 interleaved rounds per API, measured on the branch head `c2de600`
+(which includes fixes 4 and 5). Every row passed the quiet gate on its
+first attempt. The rsloop 0.1.64 and asyncio figures are **not** from that run: they
+come from the earlier four-arm rounds at `b15c357`
+([Earlier four-arm run](#earlier-four-arm-run-b15c357)). See
+[Status and what is unverified](#status-and-what-is-unverified).
 
 ## Summary
 
@@ -71,17 +73,26 @@ host load. See [Status and what is unverified](#status-and-what-is-unverified).
      found by review).
   5. `6101e34` fences the runtime's park against a racing cross-thread wake,
      which v0.1.64 itself loses about once per 300–450 #115 repro runs.
-- **Result at `b15c357`** ([Latest full run](#latest-full-run-b15c357),
-  3 interleaved rounds, load per row). It predates fixes 4 and 5, which were
-  not re-measured on the services (see
-  [Status and what is unverified](#status-and-what-is-unverified)):
-  - investor_api: +3.9% vs uvloop without the bimodal `/health/` probe
-    (geometric mean, worst row +1.5%); every c16 row that was 30–46% behind
-    on 0.1.64 is at or above uvloop. Its rows ran at load1 1.1–3.8 with small
-    round spreads.
-  - admin_api: +2.0% vs uvloop (geometric mean, worst row −2.9%), **but round
-    2 of that run was contaminated by host load**, so the "within noise"
-    reading of the small differences is not supported.
+- **Result at the head `c2de600`**
+  ([Final run](#final-run-c2de600-fork-vs-uvloop): fork vs uvloop, 3
+  interleaved rounds per API, every row quiet-gated, load1 and foreign CPU
+  per row). A row is within noise when the two arms' round ranges overlap.
+  - admin_api: +2.9% vs uvloop (geometric mean). 7 of 8 rows are within
+    noise; `/auth/me` c64 is outside noise in the fork's favour (+11.7%, every
+    round +11.7…+13.1%).
+  - investor_api: +1.1% vs uvloop without the bimodal `/health/` probe; 7 of
+    8 rows are within noise. The c16 rows that were 30–46% behind on 0.1.64
+    are level: `/auth/me` −2.8% (per round −6.0…+16.2%),
+    `/notifications/unread-count` +3.4%, `/reports/` +3.5%, with CPU and new
+    Postgres sessions per 1k requests at uvloop's level.
+  - **One row is outside noise against the fork:** investor_api `/health/`
+    c64, 48 vs 49 rps (−1.8%, every round −1.6…−2.8%). That endpoint is
+    latency-bound by a per-call NATS connect (p50 ≈ 1.27 s on both loops),
+    not by CPU; asyncio sat at 48 rps there in the earlier rounds as well. It
+    is reported, not explained.
+  - The all-rows investor_api mean (−12.8%) is set by `/health/` c16, which
+    is bimodal on every loop: the fork landed in its slow mode in 2 rounds,
+    uvloop in mixed modes in 2.
 
 ## Setup
 
@@ -94,7 +105,8 @@ host load. See [Status and what is unverified](#status-and-what-is-unverified).
     volume names; no host ports) at `~/.cache/rsloop-perf/`, with its own
     Postgres/Redis/NATS seeded by the services' dev entrypoints.
 - **Arms.** uvloop 0.22.1, rsloop 0.1.64 (the image's pin), asyncio, and
-  **fork**.
+  **fork**. The final run measured uvloop and the fork only; 0.1.64 and
+  asyncio were measured in the earlier four-arm runs.
   - The fork arm uses the same image and code, with only `PYTHONPATH` putting
     the fork's wheel first.
   - The fork wheel is built with maturin (`--release --locked`, the
@@ -579,42 +591,218 @@ identical results. Script: `~/.cache/rsloop-perf/defects-fork.sh <site>`, the
 
 ## Status and what is unverified
 
-The last full-service measurement is the `b15c357` run below. Fixes 4
-(`ce45ef8`) and 5 (`6101e34`) came after it. A quiet-gated re-run of the
-service harness on `6101e34` (the plan: rounds only while the machine is idle
-outside the benchmark containers) was started and interrupted, and the
-operator decided not to repeat it. No table in this file therefore measures
-the head of the branch on the services.
+The acceptance measurement is the [Final run](#final-run-c2de600-fork-vs-uvloop)
+on the branch head `c2de600`, which contains all five fixes. It replaces two
+earlier readings:
+- The `b15c357` four-arm run predates fixes 4 and 5, and its admin_api round
+  2 was contaminated by host load. Its "within noise" reading of admin_api
+  was withdrawn and is now replaced by the final run's.
+- A quiet-gated fork-vs-uvloop attempt on `6101e34` (`*_final2.jsonl`) ran
+  partly while the machine was busy. It is superseded and not used here.
 
-What still stands:
+What stands:
 - **The root-cause analysis** (sections 2 and 3, opts 1–3). It rests on
   per-thread profiles, perf/strace, the pool trace inside the services and
-  the standalone pool repro, each measured on the arm side by side, not on
-  the final table.
-- **investor_api at `b15c357`.** Its rows ran at load1 1.1–3.8 with round
-  spreads of 0.5–11%; fork at or above uvloop on 7 of 8 rows. The c16 rows
-  behind on 0.1.64 are the ones the root cause explains.
+  the standalone pool repro, each measured on the arms side by side.
+- **Fork vs uvloop on both services at the head**: 14 of 16 rows within
+  noise, one ahead (admin_api `/auth/me` c64), one behind by about 1 rps
+  (investor_api `/health/` c64; see the final run). The investor_api c16
+  rows the root cause explains are level with uvloop, at uvloop's CPU and
+  connection churn per request.
 - **The cost of fixes 4 and 5 in microbenchmarks** ([What fixes 4 and 5
   cost](#what-fixes-4-and-5-cost)): quiet-gated, every row within its
   round-to-round spread except `xthread_burst`, and `pool_churn` unchanged.
+  The final run agrees: no service row is outside noise against the fork
+  except `/health/` c64.
 - **Correctness** (section 5): test suites, the review's ordering test and
-  the defect repros at `ce45ef8`/`6101e34`.
+  the defect repros at `ce45ef8`/`6101e34`. `c2de600` changes only files
+  under `perf/`; its release build's native module is byte-identical to the
+  `6101e34` build (sha256 `7d4e6da8…`).
 
 What is not verified:
-- **The service-level performance of `ce45ef8` and `6101e34`.** The micro
-  and `pool_churn` figures suggest no material change, but the full harness
-  has not been run on them.
-- **admin_api vs uvloop.** The `b15c357` table's round 2 was contaminated
-  (below), so its +2.0% geometric mean and the per-row differences of a few
-  percent cannot be read as "within noise". Rounds 1 and 3 ran at load1
-  about 2.5–3.5, but they were not analysed on their own and a clean re-run
-  is still needed.
+- **rsloop 0.1.64 and asyncio at the time of the final run.** They were not
+  re-run; their figures (section 1 and the
+  [Earlier four-arm run](#earlier-four-arm-run-b15c357)) come from the
+  earlier four-arm rounds on the same harness. Absolute rps drift between
+  sessions (uvloop's investor `/auth/me` c16 was 2,306 there and 2,244
+  here), so compare those arms by their ratio to uvloop within their own run,
+  not by rps across runs.
+- **The investor_api `/health/` c64 gap** (−1.8%, all three rounds). The
+  endpoint waits on a per-call NATS connect (p50 ≈ 1.27 s on both loops);
+  why the fork's requests take about 20 ms longer there was not
+  investigated. On that probe endpoint the fork also uses 200–250 µs more CPU
+  per request than uvloop at both concurrencies; the other 14 rows do not
+  show it.
+- **Which mode `/health/` c16 lands in.** It is bimodal on every loop. Over
+  this run and the `b15c357` run the fork was in the fast mode in 3 of 6
+  rounds, uvloop in 1 of 6 plus 2 mixed rounds; that cannot tell the loops
+  apart.
 - **A free-threaded interpreter**, and any CPython other than 3.14.
-- **Quiet-machine conditions.** The agent host has 3 usable CPUs and ran
-  other work throughout; no row of the full tables meets a pinned low-load
-  condition.
 
-## Latest full run (`b15c357`)
+## Final run (`c2de600`, fork vs uvloop)
+
+The acceptance table. Fork at the branch head `c2de600` vs uvloop 0.22.1;
+rsloop 0.1.64 and asyncio were **not** re-run (their figures are from the
+[Earlier four-arm run](#earlier-four-arm-run-b15c357)).
+
+- **Build.** The fork's build directory (`~/.cache/rsloop-perf/target`) was
+  deleted first; `git archive c2de600` was built with maturin
+  (`--release --locked`) in the builder image and baked into
+  `rsperf-<api>:fork` (`--no-cache`).
+  - Wheel sha256 `c5dcafcf295a3b17…`.
+  - Native module `rsloop/_loop.cpython-314-x86_64-linux-gnu.so`, sha256
+    `7d4e6da83935cbd0e3ca408588f9de52dde0fa918ba52da89e8c5b6fce1df691`.
+    The harness reads it back from every fork container it starts
+    (`fork_build_sha256` in the jsonl), and every fork start logged
+    `event loop: rsloop 0.1.64 io_uring=off`.
+- **Method.** The #1120 harness method, unchanged: 15 s warm-up, 60 s at c16
+  and c64 per endpoint, Granian with 2 workers, `--cpus 2`, oha in its own
+  `--cpus 2` container.
+  - 3 rounds per API with the arm order rotated each round (uvloop first in
+    rounds 1 and 3, the fork first in round 2). The two APIs alternate round
+    by round.
+  - Run 19:31–22:11 UTC on 2026-10-13. Driver `final4/final4.sh`; raw rows
+    in `run/bench/<api>_final4.jsonl`.
+- **Quiet gate** (`perf/bench/quiet.py`, `harness.py`). Before every row the
+  CPU used outside the benchmark's containers had to stay ≤ 2.0 cores over a
+  30 s probe; a row whose own 60 s window exceeded 2.5 cores would have been
+  discarded and measured again (up to 30 times).
+  - No row needed it: 96 clean rows, 0 discarded, 0 waits. Foreign CPU per
+    row was 0.30–1.86 cores, load1 0.3–5.2 (load1 includes the benchmark's
+    own ~2.5 cores).
+  - No non-2xx answers. The only oha errors are the in-flight requests cut
+    at each 60 s deadline (16 or 64 per row).
+- **Noise reading.** "within noise" means the two arms' per-round ranges
+  overlap. "per round" pairs the two arms measured in the same round,
+  minutes apart.
+
+**Verdict.**
+
+| | fork vs uvloop, geometric mean (all rows / without `/health`) | rows within noise | outside noise |
+|---|---|---|---|
+| admin_api | +2.9% / +3.9%, at or above uvloop on 7 of 8 rows | 7 of 8 | `/auth/me` c64 **+11.7%** (fork ahead in every round) |
+| investor_api | −12.8% / +1.1%, at or above uvloop on 5 of 8 rows | 7 of 8 | `/health/` c64 **−1.8%** (fork behind in every round, 48 vs 49 rps) |
+
+- **investor_api c16 rows** (the ones behind on 0.1.64, which was −46%,
+  −41% and −30% vs uvloop in the earlier four-arm run):
+  - `/auth/me`: −2.8% (per round −6.0…+16.2%; uvloop's own rounds span
+    1,804–2,321).
+  - `/notifications/unread-count`: +3.4%.
+  - `/reports/`: +3.5%.
+  - CPU per 1k requests is at or below uvloop's (903 / 1,099 / 1,359 vs
+    891 / 1,135 / 1,407 ms), and new Postgres sessions per 1k are at or below
+    uvloop's (2.0 / 2.5 / 2.9 vs 2.9 / 4.9 / 3.6), against 42–53 per 1k on
+    0.1.64.
+- **`/health/` c16 is bimodal on every loop.** In the fast mode p50 is
+  ≈ 8.5 ms at 400–465 rps; in the slow mode p50 is ≈ 255 ms at 70–100 rps,
+  and some rows mix the two. It is bound by the probe's per-call NATS
+  connect and close (`infrastructure/adapters/health_probe.py:57`).
+  - Here the fork was fast in round 1 (465 rps) and slow in rounds 2 and 3
+    (82 and 68). uvloop was fast in round 2 (398) and mixed in rounds 1 and 3
+    (111 and 258 rps, p95 505 and 274 ms).
+  - In the `b15c357` run uvloop was slow in all 3 rounds and the fork fast in
+    2. Over both runs the fork was fast in 3 of 6 rounds, uvloop in 1 of 6
+    plus 2 mixed: the mode does not separate the loops, and the median gap
+    (−68.2%) and the all-rows mean follow it.
+  - New Postgres sessions go with the mode on both loops (fork slow rounds
+    86 and 74 per 1k, uvloop's mixed round 1: 69 per 1k). In the fast mode
+    the fork opened 11.7 per 1k vs uvloop's 16.7, so the residual noted at
+    `b15c357` did not recur. CPU per request in the fast mode is still
+    higher on the fork: 2,030 vs 1,836 µs.
+- **`/health/` c64** is the only row outside noise against the fork: 48.2 vs
+  49.0 rps in every round. Both loops sit at p50 ≈ 1.27 s there, so the row
+  is latency-bound, not CPU-bound; the fork's requests take about 20 ms
+  longer and about 250 µs more CPU each. In the earlier four-arm run asyncio
+  was also at 48 and 0.1.64 at 48–49. Not investigated.
+
+#### `c2de600` admin_api: fork vs uvloop, median rps of 3 interleaved rounds (60 s each)
+
+| endpoint | c | uvloop (min–max) | **fork** (min–max) | fork vs uvloop | per round (min…max) | reading | CPU-ms/1k uvloop / fork | new PG sessions/1k uvloop / fork | load1 at rows (min–max) | foreign CPU cores (max) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `/health` | 16 | 421 (414–422) | **422** (408–430) | +0.2% | -1.5%…+2.0% | within noise | 3,362 / 3,433 | 41.7 / 42.1 | 1.9–4.1 | 1.64 |
+| `/health` | 64 | 501 (495–505) | **499** (496–500) | -0.4% | -1.9%…+0.7% | within noise | 3,923 / 3,984 | 64.6 / 69.7 | 1.3–3.5 | 1.67 |
+| `/auth/me` | 16 | 1,781 (1,765–1,785) | **1,836** (1,766–1,878) | +3.1% | +0.1%…+5.2% | within noise | 1,121 / 1,088 | 3.4 / 3.1 | 2.1–4.3 | 1.26 |
+| `/auth/me` | 64 | 1,687 (1,629–1,774) | **1,884** (1,836–2,006) | +11.7% | +11.7%…+13.1% | fork ahead | 1,185 / 1,061 | 2.6 / 4.8 | 1.7–4.3 | 1.55 |
+| `/trade-sessions/` | 16 | 497 (411–518) | **511** (502–533) | +2.8% | +1.2%…+24.1% | within noise | 4,021 / 3,903 | 12.6 / 15.2 | 1.7–3.8 | 1.36 |
+| `/trade-sessions/` | 64 | 469 (396–496) | **476** (438–505) | +1.5% | +1.5%…+10.6% | within noise | 4,269 / 4,196 | 9.6 / 10.1 | 1.5–4.1 | 1.58 |
+| `/positions/pnl-stats` | 16 | 1,097 (1,048–1,118) | **1,113** (1,077–1,139) | +1.5% | +1.5%…+2.8% | within noise | 1,819 / 1,788 | 5.9 / 6.3 | 2.0–3.6 | 1.39 |
+| `/positions/pnl-stats` | 64 | 1,047 (1,006–1,094) | **1,078** (1,071–1,127) | +2.9% | +2.9%…+6.5% | within noise | 1,906 / 1,850 | 4.3 / 4.0 | 1.5–3.8 | 1.29 |
+
+fork ≥ uvloop on 7 of 8 rows; geometric mean fork vs uvloop +2.9% (without `/health` rows +3.9%); 1 fork ahead, 7 within noise.
+
+Rounds per arm: uvloop 3, fork 3. Fork native module (sha256) per round: `7d4e6da83935cbd0e3ca408588f9de52dde0fa918ba52da89e8c5b6fce1df691` r1,2,3.
+
+Clean rows: 48; contaminated attempts discarded and re-measured: 0.
+
+<details><summary>admin_api: every row, every round (rps; load1 at start–end; foreign CPU cores)</summary>
+
+| endpoint | c | arm | r1 | r2 | r3 |
+|---|---|---|---|---|---|
+| `/health` | 16 | uvloop | 422 (3.4–3.9; 1.64) | 414 (1.9–2.1; 0.48) | 421 (2.9–4.1; 0.98) |
+| `/health` | 64 | uvloop | 495 (2.5–3.5; 1.67) | 505 (1.3–2.8; 0.61) | 501 (2.8–3.3; 1.10) |
+| `/auth/me` | 16 | uvloop | 1,765 (3.4–4.1; 1.22) | 1,785 (2.1–2.7; 0.56) | 1,781 (2.8–4.3; 1.26) |
+| `/auth/me` | 64 | uvloop | 1,629 (2.6–3.3; 1.55) | 1,774 (1.7–2.8; 0.54) | 1,687 (3.1–4.3; 1.03) |
+| `/trade-sessions/` | 16 | uvloop | 411 (3.0–3.6; 1.36) | 518 (2.1–2.4; 0.49) | 497 (3.6–3.8; 0.92) |
+| `/trade-sessions/` | 64 | uvloop | 396 (2.5–4.0; 1.58) | 496 (1.5–3.0; 0.44) | 469 (2.7–4.1; 0.94) |
+| `/positions/pnl-stats` | 16 | uvloop | 1,048 (3.3–2.9; 1.39) | 1,118 (2.3–2.6; 0.51) | 1,097 (2.8–3.6; 0.98) |
+| `/positions/pnl-stats` | 64 | uvloop | 1,006 (2.1–3.8; 1.29) | 1,094 (1.5–2.2; 0.57) | 1,047 (2.8–3.3; 1.03) |
+| `/health` | 16 | fork | 430 (2.3–2.9; 1.35) | 408 (2.5–2.4; 1.00) | 422 (2.8–2.4; 1.16) |
+| `/health` | 64 | fork | 499 (2.6–3.1; 1.06) | 496 (1.9–2.9; 1.11) | 500 (1.6–3.0; 1.13) |
+| `/auth/me` | 16 | fork | 1,766 (2.7–3.1; 1.03) | 1,878 (2.4–2.8; 0.44) | 1,836 (2.5–2.9; 0.98) |
+| `/auth/me` | 64 | fork | 1,836 (2.3–2.9; 0.98) | 2,006 (1.7–2.1; 0.47) | 1,884 (2.0–2.9; 0.97) |
+| `/trade-sessions/` | 16 | fork | 511 (2.1–2.8; 0.87) | 533 (1.7–2.9; 0.42) | 502 (2.5–3.2; 0.88) |
+| `/trade-sessions/` | 64 | fork | 438 (2.1–3.5; 1.51) | 505 (1.8–2.6; 0.41) | 476 (2.4–3.6; 1.03) |
+| `/positions/pnl-stats` | 16 | fork | 1,077 (3.1–3.5; 1.34) | 1,139 (2.0–2.7; 0.43) | 1,113 (2.8–3.5; 0.93) |
+| `/positions/pnl-stats` | 64 | fork | 1,071 (2.4–3.0; 1.16) | 1,127 (1.8–2.9; 0.53) | 1,078 (2.5–2.9; 0.95) |
+
+</details>
+
+#### `c2de600` investor_api: fork vs uvloop, median rps of 3 interleaved rounds (60 s each)
+
+| endpoint | c | uvloop (min–max) | **fork** (min–max) | fork vs uvloop | per round (min…max) | reading | CPU-ms/1k uvloop / fork | new PG sessions/1k uvloop / fork | load1 at rows (min–max) | foreign CPU cores (max) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `/health/` | 16 | 258 (111–398) | **82** (68–465) | -68.2% | -79.4%…+318.5% | within noise | 1,836 / 2,271 | 26.1 / 74.4 | 1.0–2.4 | 1.19 |
+| `/health/` | 64 | 49 (49–50) | **48** (48–48) | -1.8% | -2.8%…-1.6% | fork behind | 1,733 / 1,987 | 91.2 / 92.8 | 0.3–2.0 | 0.93 |
+| `/auth/me` | 16 | 2,244 (1,804–2,321) | **2,182** (2,096–2,262) | -2.8% | -6.0%…+16.2% | within noise | 891 / 903 | 2.9 / 2.0 | 0.8–2.8 | 1.06 |
+| `/auth/me` | 64 | 2,186 (2,148–2,222) | **2,207** (2,193–2,272) | +1.0% | -1.3%…+5.7% | within noise | 915 / 906 | 2.0 / 1.9 | 1.5–3.2 | 1.34 |
+| `/notifications/unread-count` | 16 | 1,761 (1,566–1,790) | **1,820** (1,774–1,851) | +3.4% | +0.8%…+18.2% | within noise | 1,135 / 1,099 | 4.9 / 2.5 | 1.8–5.1 | 1.86 |
+| `/notifications/unread-count` | 64 | 1,740 (1,623–1,764) | **1,763** (1,743–1,814) | +1.3% | -0.0%…+7.4% | within noise | 1,150 / 1,135 | 2.5 / 2.4 | 1.5–5.2 | 1.57 |
+| `/reports/` | 16 | 1,420 (1,329–1,455) | **1,470** (1,385–1,510) | +3.5% | -2.5%…+13.6% | within noise | 1,407 / 1,359 | 3.6 / 2.9 | 1.8–5.0 | 1.28 |
+| `/reports/` | 64 | 1,422 (1,420–1,439) | **1,425** (1,377–1,475) | +0.2% | -4.2%…+3.7% | within noise | 1,406 / 1,403 | 3.1 / 3.0 | 1.6–3.6 | 1.13 |
+
+fork ≥ uvloop on 5 of 8 rows; geometric mean fork vs uvloop -12.8% (without `/health` rows +1.1%); 1 fork behind, 7 within noise.
+
+Rounds per arm: uvloop 3, fork 3. Fork native module (sha256) per round: `7d4e6da83935cbd0e3ca408588f9de52dde0fa918ba52da89e8c5b6fce1df691` r1,2,3.
+
+Clean rows: 48; contaminated attempts discarded and re-measured: 0.
+
+<details><summary>investor_api: every row, every round (rps; load1 at start–end; foreign CPU cores)</summary>
+
+| endpoint | c | arm | r1 | r2 | r3 |
+|---|---|---|---|---|---|
+| `/health/` | 16 | uvloop | 111 (2.4–2.3; 1.19) | 398 (1.4–1.2; 0.42) | 258 (2.0–2.0; 0.83) |
+| `/health/` | 64 | uvloop | 49 (1.7–1.3; 0.86) | 50 (0.8–0.6; 0.30) | 49 (1.4–1.2; 0.74) |
+| `/auth/me` | 16 | uvloop | 1,804 (1.6–2.8; 1.06) | 2,321 (0.8–2.2; 0.53) | 2,244 (1.6–2.7; 0.97) |
+| `/auth/me` | 64 | uvloop | 2,222 (2.3–3.1; 0.89) | 2,148 (1.5–3.2; 1.34) | 2,186 (2.3–3.0; 1.06) |
+| `/notifications/unread-count` | 16 | uvloop | 1,790 (2.1–3.6; 1.08) | 1,566 (3.4–5.1; 1.86) | 1,761 (2.6–3.6; 0.94) |
+| `/notifications/unread-count` | 64 | uvloop | 1,623 (3.8–5.2; 1.57) | 1,740 (4.0–3.5; 1.31) | 1,764 (2.3–3.1; 0.97) |
+| `/reports/` | 16 | uvloop | 1,420 (3.7–5.0; 1.28) | 1,329 (2.5–3.8; 0.99) | 1,455 (2.6–4.0; 1.07) |
+| `/reports/` | 64 | uvloop | 1,439 (3.5–3.6; 0.86) | 1,422 (2.7–3.4; 1.13) | 1,420 (2.5–3.0; 0.96) |
+| `/health/` | 16 | fork | 465 (1.7–2.4; 0.80) | 82 (1.5–1.0; 0.33) | 68 (1.4–1.2; 0.81) |
+| `/health/` | 64 | fork | 48 (2.0–1.2; 0.93) | 48 (0.6–0.3; 0.31) | 48 (0.9–1.3; 0.86) |
+| `/auth/me` | 16 | fork | 2,096 (1.9–2.3; 0.96) | 2,182 (0.9–2.3; 0.45) | 2,262 (1.4–2.3; 0.93) |
+| `/auth/me` | 64 | fork | 2,193 (1.6–2.8; 0.94) | 2,272 (1.7–2.4; 0.45) | 2,207 (1.8–2.7; 0.94) |
+| `/notifications/unread-count` | 16 | fork | 1,820 (2.2–4.1; 0.73) | 1,851 (1.8–2.3; 0.44) | 1,774 (2.7–3.0; 1.00) |
+| `/notifications/unread-count` | 64 | fork | 1,743 (3.6–4.3; 1.05) | 1,814 (1.5–2.4; 0.50) | 1,763 (2.4–3.2; 0.94) |
+| `/reports/` | 16 | fork | 1,385 (3.0–4.5; 0.92) | 1,510 (1.8–2.4; 0.45) | 1,470 (2.6–3.1; 0.93) |
+| `/reports/` | 64 | fork | 1,377 (3.6–3.4; 1.08) | 1,475 (1.6–2.2; 0.53) | 1,425 (2.2–3.0; 1.03) |
+
+</details>
+
+## Earlier four-arm run (`b15c357`)
+
+This run is the source of the rsloop 0.1.64 and asyncio figures: the final
+run above did not re-measure those two arms. It predates fixes 4 and 5.
 
 The independent review of this run (of the commit that introduced it,
 `c20aad5`) found the admin_api round 2 contaminated. Its rows ran at
@@ -625,14 +813,15 @@ contention, not loop noise:
   two rounds;
 - uvloop `/auth/me` c16: 1,574 vs 1,860 and 1,865.
 
-The medians below include that round, so they and their "within noise"
-reading are **not supported**; the per-round values are in the collapsed
-tables. The investor_api rows ran at load1 1.1–3.8 and are not affected in
-the same way.
+The medians below include that round, so their "within noise" reading was
+withdrawn; the [Final run](#final-run-c2de600-fork-vs-uvloop) replaces it
+for fork vs uvloop. The per-round values are in the collapsed tables. The
+investor_api rows ran at load1 1.1–3.8 and are not affected in the same way.
+Use the 0.1.64 and asyncio columns by their ratio to uvloop within this run.
 
-Fork at `b15c357` (the branch head's code; wheel baked into
-`rsperf-<api>:fork` by the compose project) vs rsloop 0.1.64 (the image pin)
-vs uvloop 0.22.1 vs asyncio.
+Fork at `b15c357` (opt 3; wheel baked into `rsperf-<api>:fork` by the
+compose project) vs rsloop 0.1.64 (the image pin) vs uvloop 0.22.1 vs
+asyncio.
 
 - The #1120 harness method: 3 interleaved rounds with rotated arm order,
   15 s warm-up, 60 s per row, Granian with 2 workers, `--cpus 2`.
@@ -945,7 +1134,9 @@ All under `~/.cache/rsloop-perf/`:
 | `override.yml`, `bin-dc.sh`, `fork-image/` | the isolated `rsperf` compose project and the fork image build |
 | `bench/harness.py` | the #1120 harness for `rsperf`. Arms `uvloop`, `rsloop`, `fork`, `fork:<site>`, `<arm>@nospin`. `harness.py api <api> [rounds]`. Quiet-gated since the final run (`QUIET_*` variables); copied into `perf/bench/` |
 | `bench/quiet.py` | the quiet-machine probe: CPU used outside the `rsperf_*` containers over a window; copied into `perf/bench/` |
-| `bench/final2.sh`, `bench/compare_final.py` | the quiet-gated final run (one rotated round per call) and its table (`compare_final.py _final2`); `compare_final.py` is copied into `perf/bench/`. That run was interrupted and not repeated (see [Status and what is unverified](#status-and-what-is-unverified)). `bench/final.sh` produced the `b15c357` run |
+| `final4/build.sh`, `final4/final4.sh`, `final4/missing.py` | the final run: clean fork build and image bake, then 3 rotated fork-vs-uvloop rounds per API under the quiet gate (`BENCH_SUFFIX=_final4`, `QUIET_ATTEMPTS=30`, `QUIET_PROBE_S=30`), re-measuring any (round, arm) left without a clean row; log `run/bench/final4.log`, build log `final4/build.log` |
+| `bench/compare_final.py` | the tables (`compare_final.py _final4` for the final run; `_final` for the `b15c357` run); copied into `perf/bench/`. A uvloop-and-fork-only run gets the two-arm table with per-round ranges and the noise reading |
+| `bench/final.sh`, `bench/final2.sh`, `bench/final3.sh` | the `b15c357` four-arm run, and the superseded quiet-gated attempt on `6101e34` (`*_final2.jsonl`, not used) |
 | `fix-fifo/scripts/i115_stress.sh <site> <runs/depth> <out>` | the #115 repro at high repetition in Docker, with a faulthandler dump of any hung run |
 | `fix-fifo/diag/i115_alarm.py`, `fix-fifo/cores/` | the SIGALRM probe and the core dumps (with a gdb sysroot) that located fix 5 |
 | `fix-fifo/scripts/micro_gated.py` | quiet-gated wrapper around `bench/run_micro.sh` |

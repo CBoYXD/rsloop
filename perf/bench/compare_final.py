@@ -5,6 +5,11 @@ usage: compare_final.py [suffix=_final] [apis...]
 
 Rows measured under the quiet gate (harness.py) carry "quiet" and "contaminated": only clean attempts
 count; a row with no clean attempt is reported and left out of the medians.
+
+A run with only the uvloop and fork arms (BENCH_ARMS=uvloop,fork) gets a two-arm table instead: each
+arm's median and its min–max over the rounds, and a noise reading per row. A row is "within noise"
+when the two arms' round ranges overlap, "fork ahead" or "fork behind" when they do not. The per-round
+column pairs the two arms measured in the same round (minutes apart).
 """
 
 import json
@@ -66,10 +71,125 @@ def load_rows(api):
     return clean, dirty
 
 
-def table(api):
+def present_arms(clean):
+    return [arm for arm in ARMS if any(k[2] == arm for k in clean)]
+
+
+def fork_builds(api):
+    """Native-module sha256 the fork arm imported, per round (harness start rows)."""
+    builds = defaultdict(set)
+    with open(f"{OUT}/{api}{SUFFIX}.jsonl") as f:
+        for line in f:
+            r = json.loads(line)
+            if r["kind"] == "start" and r["arm"].startswith("fork"):
+                builds[r.get("fork_build_sha256")].add(r["round"])
+    return builds
+
+
+def noise(fork, uvloop):
+    if min(fork) > max(uvloop):
+        return "fork ahead"
+    if max(fork) < min(uvloop):
+        return "fork behind"
+    return "within noise"
+
+
+def pair_table(api, clean, dirty):
     rows = defaultdict(list)
     order = []
+    for (path, c, arm, _round), r in sorted(clean.items(), key=lambda kv: kv[0][3]):
+        if (path, c) not in order:
+            order.append((path, c))
+        rows[(path, c, arm)].append(r)
+    paths = list(dict.fromkeys(p for p, _ in order))
+    order.sort(key=lambda k: (paths.index(k[0]), k[1]))
+    rounds = sorted({k[3] for k in clean})
+    out = [
+        f"#### {api}: fork vs uvloop, median rps of {len(rounds)} interleaved rounds (60 s each)",
+        "",
+        (
+            "| endpoint | c | uvloop (min–max) | **fork** (min–max) | fork vs uvloop | per round (min…max) | reading | "
+            "CPU-ms/1k uvloop / fork | new PG sessions/1k uvloop / fork | load1 at rows (min–max) | "
+            "foreign CPU cores (max) |"
+        ),
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    vs_uv, no_health, faster, readings = [], [], 0, defaultdict(int)
+    for path, c in order:
+        uv = [r["rps"] for r in rows[(path, c, "uvloop")]]
+        fk = [r["rps"] for r in rows[(path, c, "fork")]]
+        both = rows[(path, c, "uvloop")] + rows[(path, c, "fork")]
+        loads = [r["load1"] for r in both] + [
+            r["load1_end"] for r in both if "load1_end" in r
+        ]
+        foreigns = [foreign(r) for r in both if foreign(r) is not None]
+        cpu = {
+            arm: med([r["cpu_ms_per_1k"] for r in rows[(path, c, arm)]])
+            for arm in ("uvloop", "fork")
+        }
+        pg = {
+            arm: med([r.get("pg_sessions_per_1k") for r in rows[(path, c, arm)]])
+            for arm in ("uvloop", "fork")
+        }
+        reading = noise(fk, uv) if uv and fk else "—"
+        readings[reading] += 1
+        paired = [
+            clean[(path, c, "fork", n)]["rps"] / clean[(path, c, "uvloop", n)]["rps"]
+            for n in rounds
+            if (path, c, "fork", n) in clean and (path, c, "uvloop", n) in clean
+        ]
+        if uv and fk:
+            vs_uv.append(med(fk) / med(uv))
+            if not path.startswith("/health"):
+                no_health.append(med(fk) / med(uv))
+            faster += med(fk) >= med(uv)
+        out.append(
+            f"| `{path}` | {c} | {f0(med(uv))} ({f0(min(uv, default=None))}–{f0(max(uv, default=None))}) | "
+            f"**{f0(med(fk))}** ({f0(min(fk, default=None))}–{f0(max(fk, default=None))}) | "
+            f"{pct(med(fk), med(uv))} | "
+            f"{pct(min(paired), 1) if paired else '—'}…{pct(max(paired), 1) if paired else '—'} | "
+            f"{reading} | {f0(cpu['uvloop'])} / {f0(cpu['fork'])} | "
+            f"{f1(pg['uvloop'])} / {f1(pg['fork'])} | {min(loads):.1f}–{max(loads):.1f} | "
+            f"{f'{max(foreigns):.2f}' if foreigns else '—'} |"
+        )
+    builds = fork_builds(api)
+    out += [
+        "",
+        (
+            f"fork ≥ uvloop on {faster} of {len(vs_uv)} rows; geometric mean fork vs uvloop {pct(geomean(vs_uv), 1)} "
+            f"(without `/health` rows {pct(geomean(no_health), 1)}); "
+            + ", ".join(f"{n} {k}" for k, n in sorted(readings.items()))
+            + "."
+        ),
+        "",
+        "Rounds per arm: "
+        + ", ".join(
+            f"{arm} {len({k[3] for k in clean if k[2] == arm})}"
+            for arm in ("uvloop", "fork")
+        )
+        + ". Fork native module (sha256) per round: "
+        + "; ".join(
+            f"`{sha}` r{','.join(map(str, sorted(r)))}" for sha, r in builds.items()
+        )
+        + ".",
+        "",
+        f"Clean rows: {len(clean)}; contaminated attempts discarded and re-measured: {sum(dirty.values())}"
+        + (
+            f"; rows without a clean attempt: {sorted(k for k in dirty if k not in clean)}"
+            if any(k not in clean for k in dirty)
+            else ""
+        )
+        + ".",
+    ]
+    return "\n".join(out) + "\n"
+
+
+def table(api):
     clean, dirty = load_rows(api)
+    if present_arms(clean) == ["uvloop", "fork"]:
+        return pair_table(api, clean, dirty)
+    rows = defaultdict(list)
+    order = []
     for (path, c, arm, _round), r in clean.items():
         if (path, c) not in order:
             order.append((path, c))
@@ -172,8 +292,10 @@ def per_round(api):
             + f"{retry})"
         )
 
+    paths = list(dict.fromkeys(k[0] for k in clean))
     for (path, c, arm), by_round in sorted(
-        rows.items(), key=lambda kv: (ARMS.index(kv[0][2]), kv[0][0], kv[0][1])
+        rows.items(),
+        key=lambda kv: (ARMS.index(kv[0][2]), paths.index(kv[0][0]), kv[0][1]),
     ):
         cells = [
             cell(by_round[i], (path, c, arm, i)) if i in by_round else "—"
