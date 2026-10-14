@@ -110,11 +110,18 @@ impl<'a> WaitForWake<'a> {
     }
 }
 
-/// Bounded busy-wait before parking in `block_on`. Cross-thread wakeups (reader
-/// worker threads, the transitional runtime thread) otherwise pay the full
-/// `driver.wait` park + interrupt round-trip, which dominates request/response
-/// ping-pong latency and inflates its variance. Env-tunable via
-/// `RSLOOP_WAKE_SPIN_US` (0 disables).
+/// Optional bounded busy-wait before parking in `block_on`, off by default.
+///
+/// A spin saves the `driver.wait` park + interrupt round-trip when the waker is
+/// a GIL-free Rust thread, but most cross-thread wakes come from Python threads
+/// (`call_soon_threadsafe` from a server's I/O threads) that still hold the
+/// GIL when the flag flips. The spinning loop thread then queues for the GIL
+/// behind those threads, each reattach costing up to the switch interval, and
+/// request starts and completions arrive in bursts: behind Granian with a
+/// small SQLAlchemy pool that made the pool discard and reopen connections
+/// (~55 new Postgres sessions per 1k requests vs 0 parked). A parked loop
+/// wakes once the producer has let go of the GIL and drains everything queued.
+/// `RSLOOP_WAKE_SPIN_US` opts back in (microseconds, at most 1000).
 #[cfg_attr(feature = "profile", hotpath::measure)]
 fn wake_spin_window() -> Duration {
     static WINDOW: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -122,7 +129,7 @@ fn wake_spin_window() -> Duration {
         let micros = std::env::var("RSLOOP_WAKE_SPIN_US")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(50);
+            .unwrap_or(0);
         Duration::from_micros(micros.min(1_000))
     })
 }
@@ -1106,12 +1113,11 @@ impl LoopCore {
                 }
             }
 
-            // Wait for the next wakeup with the GIL released. First spin
-            // briefly to catch an imminent cross-thread wake
-            // (reader worker / runtime thread) in user space — this
-            // keeps request/response ping-pong latency low and
-            // tight. On spin timeout (or after too many consecutive
-            // catches, to avoid starving this loop's own runtime
+            // Wait for the next wakeup with the GIL released. When
+            // `RSLOOP_WAKE_SPIN_US` enables it, first spin briefly to catch an
+            // imminent cross-thread wake in user space (see
+            // `wake_spin_window`). On spin timeout (or after too many
+            // consecutive catches, to avoid starving this loop's own runtime
             // tasks) park by driving the runtime: its `driver.wait` runs here
             // on the loop thread and is interrupted by a
             // cross-thread wake. Keep the `!Send` runtime lookup
