@@ -102,7 +102,7 @@ impl ServerCore {
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ServerCore"))]
     #[inline]
-    pub(super) fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.state.lock().expect("poisoned server state").closed
     }
 
@@ -190,9 +190,10 @@ impl ServerCore {
             // them by where it happens to run, and `create_server`
             // runs its body on an executor thread while `close()` is called
             // from Python on the loop thread, so the two decisions routinely
-            // disagree. Try the local registry, then fall back to the command
-            // path rather than assuming.
-            if self.loop_core.on_runtime_thread() && self.loop_core.stop_io_task(fd) {
+            // disagree. The local registry remains accessible between runs,
+            // when on_runtime_thread() is false. Try it before falling back to
+            // the command path.
+            if self.loop_core.stop_io_task(fd) {
                 continue;
             }
             let _ = self
@@ -292,8 +293,9 @@ impl ServerCore {
             let task_guard = ServerAcceptTaskGuard::new(&server);
             // On the loop thread, host the accept loop directly on the loop's
             // own runtime so accepted connections are delivered without a
-            // cross-thread hop. Off-thread callers fall back to the
-            // transitional runtime-thread command path.
+            // cross-thread hop. Off-thread startup commands are routed to
+            // the active loop's ready queue; the dispatcher is the fallback
+            // when no loop run is active.
             if self.loop_core.on_runtime_thread() {
                 self.loop_core
                     .spawn_io_tracked(fd, run_server_accept_task(server, listener, task_guard));

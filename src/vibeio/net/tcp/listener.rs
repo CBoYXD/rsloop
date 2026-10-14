@@ -80,6 +80,27 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
+    /// Accept an endpoint for handoff to another transport, without registering
+    /// a temporary async stream or querying an unused peer address.
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "TcpListener", future = true)
+    )]
+    pub async fn accept_std(&self) -> io::Result<std::net::TcpStream> {
+        #[cfg(unix)]
+        {
+            let mut op = crate::vibeio::op::AcceptSocketOp::new(&self.handle);
+            let socket = poll_fn(move |cx| self.handle.poll_op(cx, &mut op)).await?;
+            Ok(std::net::TcpStream::from(socket))
+        }
+        #[cfg(windows)]
+        {
+            let mut op = AcceptOp::new(&self.handle);
+            let (socket, _) = poll_fn(move |cx| self.handle.poll_op(cx, &mut op)).await?;
+            Ok(std::net::TcpStream::from(socket))
+        }
+    }
+
     /// Creates a new `TcpListener` which will be bound to the specified
     /// address.
     ///
@@ -239,6 +260,39 @@ impl IntoRawSocket for TcpListener {
 #[cfg(test)]
 mod socket_creation_tests {
     use super::*;
+
+    #[test]
+    fn accepted_std_socket_preserves_flags_data_and_ownership() {
+        use std::io::{Read, Write};
+        let runtime = crate::vibeio::RuntimeBuilder::new().build().unwrap();
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let mut accepted = listener.accept_std().await.unwrap();
+            // Completion accepts must preserve their NONBLOCK flag rather
+            // than registering and converting to a blocking async endpoint.
+            #[cfg(unix)]
+            {
+                // SAFETY: accepted owns the live fd; fcntl takes no pointers.
+                let status = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFL) };
+                // SAFETY: accepted owns the live fd; fcntl takes no pointers.
+                let flags = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFD) };
+                assert_ne!(status, -1);
+                assert_ne!(flags, -1);
+                #[cfg(any(syscall_accept4, target_os = "linux"))]
+                assert_ne!(status & libc::O_NONBLOCK, 0);
+                assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            }
+            accepted.write_all(b"hello").unwrap();
+            peer.set_read_timeout(Some(crate::vibeio::test_support::WATCHDOG))
+                .unwrap();
+            let mut payload = [0; 5];
+            peer.read_exact(&mut payload).unwrap();
+            assert_eq!(&payload, b"hello");
+            drop(accepted);
+            crate::vibeio::test_support::assert_eof(&mut peer);
+        });
+    }
 
     #[test]
     fn configured_listener_accepts_and_rejects_duplicate_bind() {

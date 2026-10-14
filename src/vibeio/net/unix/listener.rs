@@ -55,6 +55,18 @@ pub struct UnixListener {
 }
 
 impl UnixListener {
+    /// Accept an endpoint without registering a temporary async stream or
+    /// querying its peer address.
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "UnixListener", future = true)
+    )]
+    pub async fn accept_std(&self) -> io::Result<StdUnixStream> {
+        let mut op = AcceptUnixOp::new(&self.handle);
+        let socket = poll_fn(move |cx| self.handle.poll_op(cx, &mut op)).await?;
+        Ok(StdUnixStream::from(socket))
+    }
+
     /// Creates a new `UnixListener` which will be bound to the specified path.
     ///
     /// Binding is synchronous; the returned listener supports async accepts.

@@ -29,7 +29,6 @@ pub(crate) struct RemoteWakeContext {
 pub(crate) struct TaskWake {
     pub(crate) remote_wake: std::sync::Weak<RemoteWakeContext>,
     pub(crate) queued: AtomicBool,
-    pub(crate) thread_id: std::thread::ThreadId,
     pub(crate) token: usize,
 }
 
@@ -75,15 +74,14 @@ impl ArcWake for TaskWake {
 impl TaskWake {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TaskWake"))]
     fn enqueue_if_needed(wake: &Arc<Self>) {
+        let was_queued = wake.queued.swap(true, Ordering::AcqRel);
+        if !was_queued && crate::vibeio::executor::enqueue_local_wake(wake) {
+            return;
+        }
         let Some(remote) = wake.remote_wake.upgrade() else {
             return;
         };
-        if !wake.queued.swap(true, Ordering::Relaxed) {
-            if std::thread::current().id() == wake.thread_id
-                && crate::vibeio::executor::enqueue_local_wake(wake, &remote)
-            {
-                return;
-            }
+        if !was_queued {
             remote.queue.push(wake.clone());
         }
         if remote.waiting.load(Ordering::Acquire)
@@ -104,7 +102,6 @@ mod tests {
             wake: Arc::new(TaskWake {
                 remote_wake: std::sync::Weak::new(),
                 queued: AtomicBool::new(false),
-                thread_id: std::thread::current().id(),
                 token: 0,
             }),
             token: 0,

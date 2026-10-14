@@ -53,12 +53,11 @@ pub(crate) fn capture_callback_context(
 #[inline]
 pub fn is_nested_context_error(py: Python<'_>, err: &PyErr) -> bool {
     err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py)
-        && err
-            .value(py)
-            .str()
-            .ok()
-            .and_then(|message| message.to_str().ok().map(str::to_owned))
-            .is_some_and(|message| message.contains("is already entered"))
+        && err.value(py).str().ok().is_some_and(|message| {
+            message
+                .to_str()
+                .is_ok_and(|s| s.contains("is already entered"))
+        })
 }
 
 #[inline]

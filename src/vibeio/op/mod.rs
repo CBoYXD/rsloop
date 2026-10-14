@@ -50,7 +50,7 @@ use std::{
 
 pub use accept::AcceptOp;
 #[cfg(unix)]
-pub use accept_unix::AcceptUnixOp;
+pub use accept_unix::{AcceptSocketOp, AcceptUnixOp};
 pub use connect::ConnectOp;
 #[cfg(all(target_os = "linux", feature = "fs"))]
 pub use fsync::FsyncOp;

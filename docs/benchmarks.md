@@ -194,3 +194,102 @@ taskset -c 2 .venv/bin/python benches/workload_matrix.py \
 
 Raw measurements from this session are saved in
 `target/analysis-{before,after}-{reads,network}.json` (local build artifacts).
+
+
+## Updated report: accept routing and runtime overhead
+
+Measured October 14, 2026 against commit `4eb28e1` (which already contains the
+stream optimizations above). Both versions use rsloop 0.1.64 release builds,
+CPython 3.14.7 with the GIL enabled, and CPU 2 on the same Linux host. Each
+value is the median of seven measured runs after two warmups. These benchmarks
+ran without concurrent build or test work from this session.
+
+The updated report's highest-priority accept findings apply to the current
+code. Server startup uses a background bridge; its accept-start command now
+routes to the active loop runtime, while hostname resolution remains on its
+existing path. Accept cancellation also works between loop runs. TCP and Unix
+listeners can hand off a standard owned socket directly, skipping temporary
+async-stream registration/deregistration and unused peer-address queries.
+Linux raw accepts use multishot accept with CLOEXEC and NONBLOCK set by the
+kernel; the existing address-returning listener APIs retain their behavior.
+
+Other changes reuse empty callback contexts only when the GIL is held, the
+context remains empty after exit, and no retained token references it. Loop
+parking borrows its wake state and pins Sleep on the stack. Runtime::block_on
+reuses its root notifier/waker, local task wakes skip Weak::upgrade and thread
+ID lookup, and empty timer heaps skip the clock read. The runtime's task-batch
+allocation policy remains as before; these changes do not make all parking
+allocation-free.
+
+Time is milliseconds; negative differences are faster. Throughput change is
+`before / after - 1`.
+
+| Workload | Before (ms) | After (ms) | Difference (ms) | Throughput change |
+|---|---:|---:|---:|---:|
+| callbacks | 176.36 | 175.37 | -0.99 | +0.57% |
+| tasks | 310.11 | 311.88 | +1.77 | -0.57% |
+| tcp_streams | 363.20 | 361.78 | -1.42 | +0.39% |
+| http_keepalive | 142.55 | 142.06 | -0.50 | +0.35% |
+| tls_http | 356.84 | 356.43 | -0.41 | +0.12% |
+| websocket_messages | 1598.36 | 1590.18 | -8.17 | +0.51% |
+| websocket_tls | 1871.70 | 1843.38 | -28.32 | +1.54% |
+| 8,000 short TCP connections | 975.57 | 863.89 | -111.68 | +12.93% |
+
+Callbacks schedule 1,000,000 items; tasks execute 200,000 tiny tasks in batches
+of 5,000; TCP performs 20,000 round trips with 1,024-byte payloads. The network
+matrix uses the same 16 connections and 500 operations per connection as the
+previous section. Short-connection churn uses 16 concurrent clients, each
+opening, validating a one-byte echo, and closing 500 fresh connections. Its
+timer includes connection setup, data exchange, connection teardown, and
+server shutdown, and excludes listener creation. GC is disabled in that
+benchmark. Each churn sample uses a new loop and server.
+
+The short-connection result is the clearest improvement: before samples ranged
+from 970.41–985.35 ms, and after samples from 860.36–868.16 ms. General workload
+changes of roughly 0–1.5% remain within local shared-host variability; the
+report's predicted large callback/steady-state gains were not demonstrated.
+The combined measurements do not isolate individual optimizations.
+
+A separate `strace -f -qq -c` sample with 128 fresh connections confirms the
+accept path removes calls in the selected syscall categories below. Traced
+runs are excluded from the timing table; these counts do not cover all
+syscalls and do not establish the report's estimate of 5–6 calls per accept.
+
+| Selected syscall | Before calls | After calls |
+|---|---:|---:|
+| `fcntl` | 520 | 392 |
+| `getpeername` | 384 | 256 |
+| `io_uring_register` | 515 | 387 |
+| `getsockname` | 770 | 770 |
+
+Trace summaries are saved in `target/report-v2-{before,after}-syscalls.txt`.
+
+Validation: 637 Python tests passed (13 skipped, 176 deselected); all 356 Rust
+unit tests passed. New regressions cover tokens retaining an empty context,
+accepted socket flags/data/ownership, and successive borrowed block_on roots
+after a panic. Clippy passed with warnings denied, and the embedded runtime
+compiled for x86_64 Windows GNU. The profile-enabled build also compiled.
+Runtime behavior was tested on Linux.
+
+Reproduce against each revision after building it in release mode:
+
+```bash
+taskset -c 2 .venv/bin/python benches/compare_event_loops.py \
+  --loops rsloop --repeat 7 --warmups 2 --callbacks 1000000 --tasks 200000 \
+  --task-batch-size 5000 --tcp-roundtrips 20000 --payload-size 1024 \
+  --json-output target/report-v2-after-loops.json
+taskset -c 2 .venv/bin/python benches/workload_matrix.py \
+  --loops rsloop \
+  --scenarios http_keepalive,tls_http,websocket_messages,websocket_tls \
+  --concurrency 16 --requests-per-connection 500 --warmups 2 --repeat 7 \
+  --json-output target/report-v2-after-network.json
+taskset -c 2 .venv/bin/python benches/connection_churn.py \
+  --connections 8000 --concurrency 16 --repeat 7 --warmups 2 \
+  --output target/report-v2-after-churn.json
+```
+
+For baseline churn, use the same benchmark script with `4eb28e1`'s extension.
+This session built that revision in `target/report-v2-baseline-src` and selected
+its Python package with `PYTHONPATH`; the recorded native-module paths confirm
+the two measurements loaded different builds. Raw samples are saved locally
+in `target/report-v2-{before,after}-{loops,network,churn}.json`.

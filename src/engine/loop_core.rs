@@ -33,7 +33,7 @@ use super::{
     callbacks::{CallbackArgs, CallbackId, CallbackKind, ReadyCallback, TimerCallback},
     commands::{
         AcceptedConnection, FutureCompletion, LoopCommand, LoopFutureCommand, LoopIoCommand,
-        LoopRunCommand, LoopTransportCommand, ReadyItem,
+        LoopRunCommand, LoopTransportCommand, ReadyItem, ServerAcceptStart,
     },
     dispatcher::run_runtime_thread,
     timer_entry::{TimerEntry, TimerQueue},
@@ -99,28 +99,31 @@ impl LoopWake {
     }
 }
 
-/// The park primitive for the loop thread. `run_forever` drives this to
-/// completion via `runtime.block_on` with the GIL released, so vibeio's reactor
-/// (`driver.wait`) runs on the loop thread instead of a separate one. It
-/// resolves when a ready item is enqueued (`LoopWake::signal`) or the
-/// signal-poll timeout elapses, at which point `run_forever` re-acquires the
-/// GIL and drains.
-struct WaitForWake {
-    wake: Arc<LoopWake>,
-    sleep: Pin<Box<crate::vibeio::time::Sleep>>,
+pin_project_lite::pin_project! {
+    /// The park primitive for the loop thread. `run_forever` drives this to
+    /// completion via `runtime.block_on` with the GIL released, so vibeio's reactor
+    /// (`driver.wait`) runs on the loop thread instead of a separate one. It
+    /// resolves when a ready item is enqueued (`LoopWake::signal`) or the
+    /// signal-poll timeout elapses, at which point `run_forever` re-acquires the
+    /// GIL and drains.
+    struct WaitForWake<'a> {
+        wake: &'a LoopWake,
+        #[pin]
+        sleep: crate::vibeio::time::Sleep,
+    }
 }
 
-impl WaitForWake {
+impl<'a> WaitForWake<'a> {
     #[cfg(test)]
-    fn new(wake: Arc<LoopWake>, timeout: Duration) -> Self {
+    fn new(wake: &'a LoopWake, timeout: Duration) -> Self {
         Self::until(wake, Instant::now() + timeout)
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "WaitForWake"))]
-    fn until(wake: Arc<LoopWake>, deadline: Instant) -> Self {
+    fn until(wake: &'a LoopWake, deadline: Instant) -> Self {
         Self {
             wake,
-            sleep: Box::pin(crate::vibeio::time::Sleep::sleep_until(deadline)),
+            sleep: crate::vibeio::time::Sleep::sleep_until(deadline),
         }
     }
 }
@@ -153,7 +156,7 @@ const MAX_CONSECUTIVE_SPINS: u32 = 64;
 // the low-latency path as soon as traffic turns interactive again.
 const SPIN_MISS_COOLDOWN_PARKS: u32 = 8;
 
-impl Future for WaitForWake {
+impl Future for WaitForWake<'_> {
     type Output = ();
 
     #[cfg_attr(
@@ -161,17 +164,18 @@ impl Future for WaitForWake {
         hotpath::measure(impl_type = "<WaitForWake as Future>")
     )]
     #[inline]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.wake.ready_pending.load(Ordering::Acquire) {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project();
+        if this.wake.ready_pending.load(Ordering::Acquire) {
             return Poll::Ready(());
         }
         // Register before the second check so a wake that races with
         // registration is never lost.
-        self.wake.ready_waker.register(cx.waker());
-        if self.wake.ready_pending.load(Ordering::Acquire) {
+        this.wake.ready_waker.register(cx.waker());
+        if this.wake.ready_pending.load(Ordering::Acquire) {
             return Poll::Ready(());
         }
-        if self.sleep.as_mut().poll(cx).is_ready() {
+        if this.sleep.poll(cx).is_ready() {
             return Poll::Ready(());
         }
         Poll::Pending
@@ -239,6 +243,9 @@ impl<'a> LocalTimers<'a> {
         let cancelled = self.core.cancelled_timers.load(Ordering::Relaxed);
         if cancelled > 100 && cancelled > self.heap.len() / 2 {
             self.heap.compact_cancelled(ready);
+        }
+        if self.heap.is_empty() {
+            return;
         }
         let now = Instant::now();
         while self
@@ -393,7 +400,7 @@ pub struct LoopCore {
     pending_timers_dirty: AtomicBool,
     cancelled_timers: Arc<AtomicUsize>,
     // Wakes the loop thread when a producer enqueues a ready item. Held in an
-    // Arc so the park future (`WaitForWake`) can own a clone under `py.detach`.
+    // Shared with producers; the park future borrows it under `py.detach`.
     wake: Arc<LoopWake>,
 }
 
@@ -952,6 +959,33 @@ impl LoopCore {
                     ReadyItem::ProcessTransport(core) => {
                         core.drain_pending_events_with_py(py)?;
                     }
+                    ReadyItem::StartServerAccept(start) => {
+                        let ServerAcceptStart {
+                            fd,
+                            server,
+                            listener,
+                            task_guard,
+                        } = *start;
+                        // close() can race with a startup queued by a bridge
+                        // worker. Dropping the guard acknowledges that startup.
+                        if !server.is_closed() {
+                            assert!(self.spawn_io_tracked(
+                                fd,
+                                crate::transport::stream::run_server_accept_task(
+                                    server, listener, task_guard
+                                )
+                            ));
+                        }
+                    }
+                    ReadyItem::StopServerAccept(fd) => {
+                        if !self.stop_io_task(fd) {
+                            // Servers started outside an active run can still
+                            // belong to the dispatcher runtime.
+                            let _ = self.send_remote_command(LoopCommand::Io(
+                                LoopIoCommand::StopServerAccept(fd),
+                            ));
+                        }
+                    }
                     ReadyItem::ServerAccepted(payload) => {
                         let AcceptedConnection { server, stream } = *payload;
                         if let Err(err) = crate::transport::stream::spawn_accepted_transport_with_py(
@@ -1078,7 +1112,7 @@ impl LoopCore {
                     consecutive_spins += 1;
                 } else {
                     consecutive_spins = 0;
-                    let wait = WaitForWake::until(Arc::clone(&self.wake), park_deadline);
+                    let wait = WaitForWake::until(&self.wake, park_deadline);
                     LOOP_RUNTIMES.with(|runtimes| {
                         let runtimes = runtimes.borrow();
                         let runtime = runtimes
@@ -1539,6 +1573,47 @@ impl LoopCore {
     #[inline]
     fn try_handle_local_command(&self, command: LoopCommand) -> Result<(), LoopCommand> {
         match command {
+            LoopCommand::Io(LoopIoCommand::StartServerAccept {
+                fd,
+                server,
+                listener,
+                task_guard,
+            }) => self
+                .try_enqueue_local_ready(ReadyItem::StartServerAccept(Box::new(
+                    ServerAcceptStart {
+                        fd,
+                        server,
+                        listener,
+                        task_guard,
+                    },
+                )))
+                .or_else(|item| self.try_enqueue_active_ready(item))
+                .map_err(|item| match item {
+                    ReadyItem::StartServerAccept(start) => {
+                        let ServerAcceptStart {
+                            fd,
+                            server,
+                            listener,
+                            task_guard,
+                        } = *start;
+                        LoopCommand::Io(LoopIoCommand::StartServerAccept {
+                            fd,
+                            server,
+                            listener,
+                            task_guard,
+                        })
+                    }
+                    _ => unreachable!("accept startup preserves item kind"),
+                }),
+            LoopCommand::Io(LoopIoCommand::StopServerAccept(fd)) => self
+                .try_enqueue_local_ready(ReadyItem::StopServerAccept(fd))
+                .or_else(|item| self.try_enqueue_active_ready(item))
+                .map_err(|item| match item {
+                    ReadyItem::StopServerAccept(fd) => {
+                        LoopCommand::Io(LoopIoCommand::StopServerAccept(fd))
+                    }
+                    _ => unreachable!("accept stop preserves item kind"),
+                }),
             #[cfg(unix)]
             LoopCommand::Io(LoopIoCommand::StartSocketReader {
                 fd,
@@ -1597,6 +1672,23 @@ impl LoopCore {
                     }
                     ReadyItem::ProcessTransport(core) => {
                         LoopCommand::Transport(LoopTransportCommand::Process(core))
+                    }
+                    ReadyItem::StartServerAccept(start) => {
+                        let ServerAcceptStart {
+                            fd,
+                            server,
+                            listener,
+                            task_guard,
+                        } = *start;
+                        LoopCommand::Io(LoopIoCommand::StartServerAccept {
+                            fd,
+                            server,
+                            listener,
+                            task_guard,
+                        })
+                    }
+                    ReadyItem::StopServerAccept(fd) => {
+                        LoopCommand::Io(LoopIoCommand::StopServerAccept(fd))
                     }
                     ReadyItem::ServerAccepted(payload) => {
                         let AcceptedConnection { server, stream } = *payload;
@@ -1953,7 +2045,7 @@ mod wake_tests {
     fn wait_for_wake_observes_a_signal_that_arrived_before_polling() {
         let wake = Arc::new(LoopWake::new());
         wake.signal();
-        let mut wait = Box::pin(WaitForWake::new(wake, Duration::from_secs(1)));
+        let mut wait = Box::pin(WaitForWake::new(&wake, Duration::from_secs(1)));
         let task_waker = noop_waker();
         let mut context = Context::from_waker(&task_waker);
 
@@ -1984,10 +2076,7 @@ mod wake_tests {
         let wake = Arc::new(LoopWake::new());
         let started = Instant::now();
 
-        runtime.block_on(WaitForWake::new(
-            Arc::clone(&wake),
-            Duration::from_millis(2),
-        ));
+        runtime.block_on(WaitForWake::new(&wake, Duration::from_millis(2)));
 
         assert!(!wake.ready_pending.load(Ordering::Acquire));
         assert!(started.elapsed() >= Duration::from_millis(1));

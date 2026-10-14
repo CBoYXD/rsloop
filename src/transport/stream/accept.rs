@@ -14,11 +14,9 @@
 //! flood is shed here rather than deeper in.
 
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
-#[cfg(windows)]
-use std::os::windows::io::IntoRawSocket;
 #[cfg(windows)]
 use std::rc::Rc;
 use std::{
@@ -32,8 +30,6 @@ use std::{
 
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
-#[cfg(windows)]
-use super::platform::from_owned_raw_socket;
 #[cfg(unix)]
 use super::socket_transport::spawn_unix_transport;
 use super::{
@@ -372,10 +368,8 @@ pub(super) async fn run_windows_tcp_accept_lane(
             return;
         }
 
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let raw = stream.into_raw_socket();
-                let stream = from_owned_raw_socket::<StdTcpStream>(raw);
+        match listener.accept_std().await {
+            Ok(stream) => {
                 if !configure_accepted_tcp_stream(
                     &server,
                     &stream,
@@ -413,11 +407,8 @@ pub(super) async fn run_tcp_accept_lane(server: Arc<ServerCore>, listener: StdTc
             return;
         }
 
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                // SAFETY: `into_raw_fd` transfers sole ownership to
-                // `StdTcpStream`.
-                let stream = unsafe { StdTcpStream::from_raw_fd(stream.into_raw_fd()) };
+        match listener.accept_std().await {
+            Ok(stream) => {
                 if !configure_accepted_tcp_stream(
                     &server,
                     &stream,
@@ -507,11 +498,8 @@ pub(super) async fn run_unix_accept_task(server: Arc<ServerCore>, listener: StdU
             return;
         }
 
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                // SAFETY: `into_raw_fd` transfers sole ownership to
-                // `StdUnixStream`.
-                let stream = unsafe { StdUnixStream::from_raw_fd(stream.into_raw_fd()) };
+        match listener.accept_std().await {
+            Ok(stream) => {
                 if !configure_accepted_unix_stream(
                     &server,
                     &stream,

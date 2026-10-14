@@ -11,19 +11,23 @@ use mio::Interest;
 
 #[cfg(any(not(syscall_accept4), not(target_os = "linux")))]
 use crate::vibeio::op::io_util::set_cloexec;
-use crate::vibeio::{
-    driver::{AnyDriver, CompletionIoResult},
-    fd_inner::InnerRawHandle,
-    op::Op,
-};
+use crate::vibeio::{driver::AnyDriver, fd_inner::InnerRawHandle, op::Op};
 
-pub struct AcceptUnixOp<'a> {
+/// Accept an owned socket descriptor without querying its peer or registering
+/// the accepted endpoint with the reactor. Works for TCP and Unix listeners.
+pub struct AcceptSocketOp<'a> {
     handle: &'a InnerRawHandle,
     completion_token: Option<usize>,
 }
 
-impl<'a> AcceptUnixOp<'a> {
-    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "AcceptUnixOp"))]
+/// Compatibility name for the Unix-listener accept operation.
+pub type AcceptUnixOp<'a> = AcceptSocketOp<'a>;
+
+#[cfg(not(target_os = "linux"))]
+use crate::vibeio::driver::CompletionIoResult;
+
+impl<'a> AcceptSocketOp<'a> {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "AcceptSocketOp"))]
     #[inline]
     pub fn new(handle: &'a InnerRawHandle) -> Self {
         Self {
@@ -33,12 +37,12 @@ impl<'a> AcceptUnixOp<'a> {
     }
 }
 
-impl Op for AcceptUnixOp<'_> {
+impl Op for AcceptSocketOp<'_> {
     type Output = OwnedFd;
 
     #[cfg_attr(
         feature = "profile",
-        hotpath::measure(impl_type = "<AcceptUnixOp as Op>")
+        hotpath::measure(impl_type = "<AcceptSocketOp as Op>")
     )]
     #[cfg(target_os = "linux")]
     fn completion_returns_fd(&self) -> bool {
@@ -47,7 +51,7 @@ impl Op for AcceptUnixOp<'_> {
 
     #[cfg_attr(
         feature = "profile",
-        hotpath::measure(impl_type = "<AcceptUnixOp as Op>")
+        hotpath::measure(impl_type = "<AcceptSocketOp as Op>")
     )]
     #[inline]
     fn poll_poll(
@@ -104,7 +108,7 @@ impl Op for AcceptUnixOp<'_> {
 
     #[cfg_attr(
         feature = "profile",
-        hotpath::measure(impl_type = "<AcceptUnixOp as Op>")
+        hotpath::measure(impl_type = "<AcceptSocketOp as Op>")
     )]
     #[inline]
     fn poll_completion(
@@ -112,6 +116,14 @@ impl Op for AcceptUnixOp<'_> {
         cx: &mut Context<'_>,
         driver: &AnyDriver,
     ) -> Poll<io::Result<Self::Output>> {
+        #[cfg(target_os = "linux")]
+        let result = match driver.poll_multishot_accept(self.handle, cx) {
+            Poll::Ready(Ok(result)) => result,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        };
+
+        #[cfg(not(target_os = "linux"))]
         let result = if let Some(completion_token) = self.completion_token {
             match driver.get_completion_result(completion_token) {
                 Some(result) => {
@@ -152,7 +164,7 @@ impl Op for AcceptUnixOp<'_> {
 
     #[cfg_attr(
         feature = "profile",
-        hotpath::measure(impl_type = "<AcceptUnixOp as Op>")
+        hotpath::measure(impl_type = "<AcceptSocketOp as Op>")
     )]
     #[cfg(target_os = "linux")]
     #[inline]
@@ -167,17 +179,17 @@ impl Op for AcceptUnixOp<'_> {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
-        .flags(libc::SOCK_CLOEXEC)
+        .flags(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
         .build()
         .user_data(user_data);
         Ok(entry)
     }
 }
 
-impl Drop for AcceptUnixOp<'_> {
+impl Drop for AcceptSocketOp<'_> {
     #[cfg_attr(
         feature = "profile",
-        hotpath::measure(impl_type = "<AcceptUnixOp as Drop>")
+        hotpath::measure(impl_type = "<AcceptSocketOp as Drop>")
     )]
     #[inline]
     fn drop(&mut self) {
@@ -217,7 +229,7 @@ mod tests {
             crate::vibeio::driver::RegistrationMode::Poll,
         )
         .unwrap();
-        let mut op = AcceptUnixOp::new(&handle);
+        let mut op = AcceptSocketOp::new(&handle);
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(matches!(op.poll_poll(&mut cx, &driver), Poll::Pending));
         let mut peer = UnixStream::connect_addr(&address).unwrap();
@@ -294,7 +306,7 @@ mod tests {
         .unwrap();
         let mut peer = UnixStream::connect_addr(&address).unwrap();
         peer.set_nonblocking(true).unwrap();
-        let mut op = AcceptUnixOp::new(&handle);
+        let mut op = AcceptSocketOp::new(&handle);
         drop(complete(&mut op, &driver));
         crate::vibeio::test_support::assert_eof(&mut peer);
     }
@@ -305,7 +317,7 @@ mod tests {
             let owner = Rc::new(AnyDriver::new_mock());
             let handle = InnerRawHandle::for_mock_completion(owner.clone());
             let cancel = move || {
-                let mut op = AcceptUnixOp::new(&handle);
+                let mut op = AcceptSocketOp::new(&handle);
                 op.completion_token = Some(41);
                 drop(op);
             };
@@ -339,7 +351,7 @@ mod tests {
         let _peer = UnixStream::connect_addr(&address).unwrap();
         let mut handle = InnerRawHandle::for_mock_completion(Rc::new(AnyDriver::new_mock()));
         handle.handle = listener.as_raw_fd();
-        let mut op = AcceptUnixOp::new(&handle);
+        let mut op = AcceptSocketOp::new(&handle);
         let entry = op.build_completion_entry(17).unwrap();
         let mut ring = io_uring::IoUring::new(2).unwrap();
         // SAFETY: the listener remains open until completion and accept uses no
@@ -365,10 +377,10 @@ mod tests {
         // flags.
         let status = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(status, -1);
-        assert_eq!(
+        assert_ne!(
             status & libc::O_NONBLOCK,
             0,
-            "completion mode remains blocking"
+            "accepted endpoints remain nonblocking for transport handoff"
         );
     }
 }

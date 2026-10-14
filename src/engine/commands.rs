@@ -33,6 +33,8 @@ pub enum ReadyItem {
     StartTcpReader(Box<TcpReaderStart>),
     ProcessTransport(Arc<ProcessTransportCore>),
     ServerAccepted(Box<AcceptedConnection>),
+    StartServerAccept(Box<ServerAcceptStart>),
+    StopServerAccept(RawFd),
     // A non-blocking TCP connect finished its writability wait on the vibeio
     // reactor. The Python-object work (SO_ERROR check, set_result /
     // set_exception) is deferred to the loop thread so the vibeio side never
@@ -72,6 +74,13 @@ pub struct TcpReaderStart {
     pub fd: RawFd,
     pub core: Arc<StreamTransportCore>,
     pub stream: Arc<std::net::TcpStream>,
+}
+
+pub struct ServerAcceptStart {
+    pub fd: RawFd,
+    pub server: Arc<ServerCore>,
+    pub listener: ServerListener,
+    pub task_guard: ServerAcceptTaskGuard,
 }
 
 /// Control-plane messages consumed by the dedicated runtime dispatcher.

@@ -315,3 +315,34 @@ def test_handle_destruction_preserves_finalizers_and_weakrefs(running):
         assert all(ref() is None for ref in refs)
     finally:
         loop.close()
+
+
+@pytest.mark.parametrize("factory", [asyncio.new_event_loop, rsloop.new_event_loop])
+def test_retained_token_prevents_reuse_of_an_empty_callback_context(factory):
+    def scenario():
+        loop = factory()
+        variable = contextvars.ContextVar("retained_empty_token", default="default")
+        tokens = []
+        events = []
+
+        def first():
+            original = variable.set("first")
+            tokens.append(variable.set("second"))
+            # Leave the context empty while retaining an unused token for it.
+            variable.reset(original)
+            assert variable.get() == "default"
+
+        def sibling():
+            with pytest.raises(ValueError, match="different Context"):
+                variable.reset(tokens[0])
+            events.append(variable.get())
+
+        try:
+            loop.call_soon(first)
+            loop.call_soon(sibling)
+            loop.run_until_complete(asyncio.sleep(0))
+            assert events == ["default"]
+        finally:
+            loop.close()
+
+    contextvars.Context().run(scenario)

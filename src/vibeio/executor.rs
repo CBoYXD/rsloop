@@ -49,7 +49,7 @@ use crate::vibeio::{
 };
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
-pub(crate) fn enqueue_local_wake(wake: &Arc<TaskWake>, remote: &Arc<RemoteWakeContext>) -> bool {
+pub(crate) fn enqueue_local_wake(wake: &Arc<TaskWake>) -> bool {
     CURRENT_RUNTIME.with(|current| {
         let Ok(current) = current.try_borrow() else {
             return false;
@@ -57,7 +57,7 @@ pub(crate) fn enqueue_local_wake(wake: &Arc<TaskWake>, remote: &Arc<RemoteWakeCo
         let Some(runtime) = current.as_ref() else {
             return false;
         };
-        if !Arc::ptr_eq(&runtime.remote_wake, remote) {
+        if !std::ptr::eq(Arc::as_ptr(&runtime.remote_wake), wake.remote_wake.as_ptr()) {
             return false;
         }
         let task = {
@@ -487,6 +487,8 @@ pub(crate) struct RuntimeInner {
     remote_wake: Arc<RemoteWakeContext>,
     token_to_task: RefCell<Slab<Rc<Task>>>,
     driver: Rc<AnyDriver>,
+    root_notify: Arc<BlockOnNotify>,
+    root_waker: Waker,
     task_batch_size: usize,
     timer_poll_threshold: usize,
     blocking_pool: Option<Box<dyn BlockingThreadPool>>,
@@ -538,7 +540,6 @@ impl RuntimeInner {
             wake: Arc::new(TaskWake {
                 remote_wake: Arc::downgrade(&self.remote_wake),
                 queued: AtomicBool::new(true),
-                thread_id: std::thread::current().id(),
                 token: vacant_slab_entry.key(),
             }),
             token: vacant_slab_entry.key(),
@@ -727,6 +728,12 @@ impl Runtime {
             waiting: Arc::new(AtomicBool::new(false)),
             interrupt_pending: Arc::new(AtomicBool::new(false)),
         });
+        let root_notify = BlockOnNotify::new(
+            driver.get_interruptor(),
+            Arc::clone(&remote_wake.waiting),
+            Arc::clone(&remote_wake.interrupt_pending),
+        );
+        let root_waker = root_notify.waker();
         Runtime {
             batch_allocator: BatchAllocator::default(),
             inner: Some(Rc::new(RuntimeInner {
@@ -735,6 +742,8 @@ impl Runtime {
                 remote_wake,
                 token_to_task: RefCell::new(Slab::with_capacity(4096)),
                 driver,
+                root_notify,
+                root_waker,
                 task_batch_size,
                 timer_poll_threshold,
                 blocking_pool,
@@ -842,25 +851,21 @@ impl Runtime {
     /// the provided future completes.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "Runtime"))]
     #[inline]
-    pub fn block_on<T>(&self, future: impl Future<Output = T> + 'static) -> T
-    where
-        T: 'static,
-    {
+    pub fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
         let inner = self.inner.as_ref().expect("runtime has been dropped");
         let _runtime_guard = CurrentRuntimeGuard::enter(inner.clone());
 
         let mut future = std::pin::pin!(future);
-        let root_notify = BlockOnNotify::new(
-            inner.driver.get_interruptor(),
-            Arc::clone(&inner.remote_wake.waiting),
-            Arc::clone(&inner.remote_wake.interrupt_pending),
-        );
-        let root_waker = root_notify.waker();
+        let root_notify = &inner.root_notify;
+        // A new root must be polled even when the previous block_on consumed
+        // the notification. Old retained wakers may cause harmless extra polls.
+        root_notify.ready.store(true, Ordering::Release);
+        let root_waker = &inner.root_waker;
         let mut batch = batch(&self.batch_allocator, inner.task_batch_size);
 
         loop {
             if root_notify.take_ready() {
-                let mut context = Context::from_waker(&root_waker);
+                let mut context = Context::from_waker(root_waker);
                 if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
                     return output;
                 }
@@ -979,6 +984,27 @@ impl Drop for Runtime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn consecutive_block_on_calls_support_borrowed_roots_after_unwind() {
+        use std::cell::Cell;
+        let runtime = super::Runtime::new(crate::vibeio::driver::AnyDriver::new_mock());
+        let count = Cell::new(0);
+        for expected in 1..=3 {
+            runtime.block_on(async {
+                count.set(count.get() + 1);
+            });
+            assert_eq!(count.get(), expected);
+        }
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                panic!("root panic");
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(runtime.block_on(async { &count }).get(), 3);
+        assert!(super::current_driver().is_none());
+    }
+
     #[test]
     fn embedded_turn_polls_one_bounded_batch_and_preserves_ready_tasks() {
         use std::{cell::Cell, rc::Rc, task::Poll};
