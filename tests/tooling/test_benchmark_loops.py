@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,27 @@ import workload_matrix as matrix
 
 
 class TestBenchmarkLoop:
+    @pytest.mark.skipif(
+        sys.platform != "linux", reason="Linux per-process memory counters"
+    )
+    def test_child_peak_rss_excludes_parent_high_water_mark(self):
+        child = (
+            f"import sys; sys.path.insert(0, {str(Path(comparison.__file__).parent)!r}); "
+            "import compare_event_loops as benchmark; print(benchmark.get_peak_rss_bytes())"
+        )
+        parent = (
+            "import json, resource, subprocess, sys\n"
+            "storage = bytearray(80 * 1024 * 1024)\n"
+            "parent_peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024\n"
+            f"child_peak = int(subprocess.check_output([sys.executable, '-c', {child!r}], text=True))\n"
+            "print(json.dumps({'parent': parent_peak, 'child': child_peak}))\n"
+        )
+        measured = json.loads(
+            subprocess.check_output([sys.executable, "-c", parent], text=True)
+        )
+        assert measured["parent"] >= 80 * 1024 * 1024
+        assert 0 < measured["child"] < measured["parent"] / 2
+
     @pytest.mark.parametrize(
         "mode",
         ["timers_retained", "timers_discarded", "timers_cancelled", "timers_mixed"],

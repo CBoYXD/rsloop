@@ -256,6 +256,13 @@ def get_peak_rss_bytes() -> int:
             raise ctypes.WinError(ctypes.get_last_error())
         return int(counters.PeakWorkingSetSize)
 
+    if sys.platform == "linux":
+        # ru_maxrss survives fork/exec and can include the parent's earlier
+        # high-water mark. VmHWM describes this executed child's own memory.
+        peak_rss = _linux_rss_bytes("VmHWM:")
+        if peak_rss:
+            return peak_rss
+
     import resource
 
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -264,23 +271,23 @@ def get_peak_rss_bytes() -> int:
     return int(peak_rss * 1024)
 
 
-def get_current_rss_bytes() -> int:
+def _linux_rss_bytes(field: str) -> int:
     if sys.platform != "linux":
         return 0
-
     try:
-        with open("/proc/self/status", "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.startswith("VmRSS:"):
-                    continue
-                parts = line.split()
-                if len(parts) < 2:
-                    break
-                return int(parts[1]) * 1024
-    except OSError:
+        with open("/proc/self/status", "r", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith(field):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except (OSError, ValueError):
         return 0
-
     return 0
+
+
+def get_current_rss_bytes() -> int:
+    return _linux_rss_bytes("VmRSS:")
 
 
 def format_bytes(num_bytes: int) -> str:

@@ -2,12 +2,17 @@
 
 ## Four-loop comparison on Linux
 
-Measured on October 6, 2026 at commit `43f624a` on an Intel Core i9-9900K,
-Linux 7.0.0-38-generic (x86_64), with rsloop 0.1.57 built in release mode,
-uvloop 0.22.1, and zuvloop 0.0.17. The GIL-enabled runs use CPython 3.14.7;
-the free-threaded run uses CPython 3.14.0 with the GIL disabled for all four loops.
-Each entry is the median of seven measured runs after two warmups, with each
-run in a fresh subprocess. Cyclic garbage collection is disabled during each run.
+Remeasured October 14, 2026 using runtime commit `97fa7cf` on an Intel Core i9-9900K,
+Linux 7.0.0-38-generic (x86_64), with rsloop 0.1.64 built in release mode,
+uvloop 0.22.1 and zuvloop 0.0.17. The GIL-enabled runs use CPython 3.14.7;
+the free-threaded runs use CPython 3.14.0 with `PYTHON_GIL=0` for all four loops.
+The rsloop extension matches the verified completed-report build. Its reactor
+is io_uring. All four requested loops completed every comparison.
+
+Each general-workload result is the median of seven measured runs after two
+warmups, with every run in a fresh subprocess. Cyclic GC is disabled during
+each run. All builds and package installation finished before measurement;
+no builds or tests from this session ran alongside the benchmarks.
 
 The workloads schedule 1,000,000 callbacks as one batch, run 200,000 tiny tasks
 that each await `asyncio.sleep(0)` in batches of 5,000, and perform 20,000 TCP
@@ -16,9 +21,12 @@ the other loops use stdlib asyncio streams.
 
 Times are milliseconds (lower is better). Memory tables report the median
 of each process's peak RSS in MiB, including the interpreter and libraries.
-CPU affinity applies to each process and its threads. Allowing two physical
-cores still runs one event loop per process; it does not partition callbacks
-or tasks across two loops.
+Linux memory is read from the child's `VmHWM` counter, avoiding inherited
+parent high-water marks in `ru_maxrss`. The benchmark helper was corrected
+for this refresh; runtime code is unchanged.
+CPU affinity applies to each process and its threads. CPUs 2 and 3 are separate
+physical cores on this host; their SMT siblings are CPUs 10 and 11. Allowing
+two cores still runs one event loop per process.
 
 ### One core, GIL enabled (CPU 2)
 
@@ -26,17 +34,17 @@ Median time (ms):
 
 | Workload | asyncio | uvloop | zuvloop | rsloop |
 |---|---:|---:|---:|---:|
-| 1,000,000 callbacks | 550.3 | 258.7 | 179.5 | 182.1 |
-| 200,000 tasks | 566.2 | 341.7 | 307.6 | 325.2 |
-| 20,000 TCP round trips | 565.7 | 485.4 | 379.6 | 335.4 |
+| 1,000,000 callbacks | 540.21 | 255.99 | 182.70 | 174.51 |
+| 200,000 tasks | 560.91 | 340.24 | 294.93 | 306.45 |
+| 20,000 TCP round trips | 566.74 | 467.26 | 377.84 | 359.31 |
 
 Peak RSS (MiB):
 
 | Workload | asyncio | uvloop | zuvloop | rsloop |
 |---|---:|---:|---:|---:|
-| 1,000,000 callbacks | 201.2 | 234.7 | 126.0 | 111.7 |
-| 200,000 tasks | 31.6 | 34.5 | 33.5 | 34.8 |
-| 20,000 TCP round trips | 29.8 | 29.8 | 29.8 | 29.8 |
+| 1,000,000 callbacks | 201.0 | 234.6 | 125.9 | 103.9 |
+| 200,000 tasks | 31.7 | 34.6 | 33.4 | 34.6 |
+| 20,000 TCP round trips | 24.4 | 27.8 | 26.6 | 28.4 |
 
 ### Two cores, GIL enabled (CPUs 2–3)
 
@@ -44,17 +52,17 @@ Median time (ms):
 
 | Workload | asyncio | uvloop | zuvloop | rsloop |
 |---|---:|---:|---:|---:|
-| 1,000,000 callbacks | 674.3 | 260.7 | 184.2 | 195.2 |
-| 200,000 tasks | 571.6 | 350.3 | 305.7 | 324.0 |
-| 20,000 TCP round trips | 569.3 | 473.8 | 381.2 | 327.9 |
+| 1,000,000 callbacks | 533.23 | 254.45 | 180.93 | 173.72 |
+| 200,000 tasks | 556.59 | 341.76 | 299.91 | 303.58 |
+| 20,000 TCP round trips | 567.25 | 472.58 | 379.03 | 361.42 |
 
 Peak RSS (MiB):
 
 | Workload | asyncio | uvloop | zuvloop | rsloop |
 |---|---:|---:|---:|---:|
-| 1,000,000 callbacks | 201.2 | 234.8 | 126.0 | 111.6 |
-| 200,000 tasks | 31.6 | 34.4 | 33.5 | 34.6 |
-| 20,000 TCP round trips | 29.7 | 29.7 | 29.7 | 29.7 |
+| 1,000,000 callbacks | 201.0 | 234.6 | 125.9 | 103.9 |
+| 200,000 tasks | 31.6 | 34.5 | 33.3 | 34.6 |
+| 20,000 TCP round trips | 24.4 | 27.8 | 26.6 | 28.4 |
 
 ### One core, free-threaded (CPU 2)
 
@@ -62,36 +70,91 @@ Median time (ms):
 
 | Workload | asyncio | uvloop | zuvloop | rsloop |
 |---|---:|---:|---:|---:|
-| 1,000,000 callbacks | 913.1 | 575.9 | 216.5 | 226.8 |
-| 200,000 tasks | 671.1 | 422.3 | 378.7 | 398.3 |
-| 20,000 TCP round trips | 627.8 | 519.5 | 406.3 | 345.4 |
+| 1,000,000 callbacks | 594.68 | 296.78 | 199.94 | 212.44 |
+| 200,000 tasks | 638.17 | 397.60 | 351.12 | 353.73 |
+| 20,000 TCP round trips | 600.29 | 502.85 | 398.72 | 387.49 |
 
 Peak RSS (MiB):
 
 | Workload | asyncio | uvloop | zuvloop | rsloop |
 |---|---:|---:|---:|---:|
-| 1,000,000 callbacks | 207.8 | 256.2 | 132.8 | 193.5 |
-| 200,000 tasks | 38.8 | 41.3 | 42.4 | 42.4 |
-| 20,000 TCP round trips | 36.4 | 36.4 | 36.4 | 36.4 |
+| 1,000,000 callbacks | 208.0 | 256.7 | 133.1 | 186.8 |
+| 200,000 tasks | 39.0 | 41.5 | 42.7 | 43.0 |
+| 20,000 TCP round trips | 30.7 | 34.4 | 33.8 | 36.3 |
 
-### Interpretation and reproduction
+### Interpretation
 
-Zuvloop led callbacks and tasks in all three runs; rsloop led TCP. On one core
-with the GIL enabled, rsloop took 1.5% longer for callbacks and 5.7% longer for
-tasks than zuvloop, while delivering 13.2% higher TCP throughput. Its callback
-peak RSS was 111.7 MiB versus zuvloop's 126.0 MiB. With the GIL disabled,
-rsloop took 4.8% longer for callbacks and 5.2% longer for tasks, with 17.6%
-higher TCP throughput; its callback peak RSS rose to 193.5 MiB versus
-zuvloop's 132.8 MiB.
+One core, GIL enabled (CPU 2): rsloop led callbacks, zuvloop led tasks, and rsloop led TCP round trips.
 
-These local microbenchmarks ran on a shared host. Callback timings were
-particularly variable: the two-core rsloop runs ranged from 185.4 to 310.0 ms,
-and free-threaded asyncio ranged from 690.4 to 1,080.4 ms. The separate runs
-and different Python patch versions do not isolate the effects of core count,
-the GIL, or the latest commit. These are not general application performance
-claims.
+Two cores, GIL enabled (CPUs 2–3): rsloop led callbacks, zuvloop led tasks, and rsloop led TCP round trips.
 
-To reproduce the GIL-enabled setup from the repository root:
+One core, free-threaded (CPU 2): zuvloop led callbacks, zuvloop led tasks, and rsloop led TCP round trips.
+
+These local microbenchmarks ran on a shared host. Results include run-to-run
+variation; different CPU affinities and Python patch versions do not isolate
+the effects of core count or the GIL. Application workloads below can rank
+the loops differently from callback and task microbenchmarks.
+
+## Network workloads: all four loops
+
+Remeasured on the same release builds and host, using CPython 3.14.7 with the
+GIL enabled and CPU 2. Each entry is the median of seven measured runs after
+two warmups. The matrix uses warm measurement mode: one child process per
+loop/scenario runs all nine samples sequentially. Each sample creates a new
+loop and server. GC remains enabled in this matrix.
+
+Each run uses 16 concurrent connections with 500 operations per connection
+(8,000 operations). HTTP bodies are 4,096 bytes; WebSocket frames cycle through
+32, 256 and 4,096 bytes. Timings include connection setup and teardown, with
+eight SHA-256 iterations per HTTP request to model application work.
+
+Median time (ms):
+
+| Workload | asyncio | uvloop | zuvloop | rsloop |
+|---|---:|---:|---:|---:|
+| HTTP keep-alive | 250.58 | 147.90 | 126.63 | 137.83 |
+| TLS HTTP | 517.24 | 315.19 | 333.92 | 350.97 |
+| Raw WebSocket | 1673.65 | 1588.72 | 1572.70 | 1595.93 |
+| Raw TLS WebSocket | 1913.15 | 1755.70 | 1764.08 | 1850.40 |
+
+## Short TCP connections: all four loops
+
+Remeasured with CPython 3.14.7, the GIL enabled, and CPU 2. Each sample opens
+8,000 fresh connections at concurrency 16, validates a one-byte echo, then
+closes them. Timing includes connection setup, exchange, teardown and server
+shutdown, and excludes listener creation. GC is disabled. Each loop has two
+warmups and seven measured samples in its own process, with a new loop and
+server per sample. All loops execute the same `connection_churn.measure`
+workload through their own loop factory.
+
+Median time (ms):
+
+| Workload | asyncio | uvloop | zuvloop | rsloop |
+|---|---:|---:|---:|---:|
+| 8,000 short TCP connections | 1195.19 | 876.07 | 793.05 | 825.60 |
+
+## Native reader lifecycle
+
+This diagnostic measures rsloop's internal `PyFastStreamReader`, rather than
+comparing event loops. The current release build runs on CPU 2 with CPython
+3.14.7 and the GIL enabled. Each method has a 1,000-round warmup followed by
+seven samples of 100,000 rounds. Waiting reads include dispatch of Future
+done callbacks. GC remains enabled.
+
+Median nanoseconds per round (lower is better):
+
+| Workload | rsloop (ns) |
+|---|---:|
+| Buffered `read` | 282.9 |
+| Buffered `readexactly` | 281.6 |
+| Buffered `readuntil` | 306.4 |
+| Waiting `read` | 2310.4 |
+| Waiting `readexactly` | 1482.5 |
+| Waiting `readuntil` | 1543.1 |
+
+## Reproduction and raw samples
+
+For a clean GIL-enabled environment:
 
 ```bash
 uv venv --python 3.14.7 target/bench-gil
@@ -101,14 +164,13 @@ taskset -c 2 target/bench-gil/bin/python benches/compare_event_loops.py \
   --loops asyncio,uvloop,zuvloop,rsloop --repeat 7 --warmups 2 \
   --callbacks 1000000 --tasks 200000 --task-batch-size 5000 \
   --tcp-roundtrips 20000 --payload-size 1024 \
-  --json-output target/event-loops-43f624a-one-core.json
+  --json-output target/event-loops-97fa7cf-one-core.json
 ```
 
-For two physical cores on this host, replace `taskset -c 2` with
-`taskset -c 2,3` and use a different output filename. Check CPU topology before
-choosing affinity on another machine.
+For two physical cores on this host, use `taskset -c 2,3` and a different output
+filename. Check CPU topology before choosing affinity on another machine.
 
-For the free-threaded setup:
+For the free-threaded environment:
 
 ```bash
 uv venv --python 3.14.0t target/bench-free-threaded
@@ -118,11 +180,69 @@ PYTHON_GIL=0 taskset -c 2 target/bench-free-threaded/bin/python benches/compare_
   --loops asyncio,uvloop,zuvloop,rsloop --repeat 7 --warmups 2 \
   --callbacks 1000000 --tasks 200000 --task-batch-size 5000 \
   --tcp-roundtrips 20000 --payload-size 1024 \
-  --json-output target/event-loops-43f624a-free-threaded.json
+  --json-output target/event-loops-97fa7cf-free-threaded.json
 ```
 
+Run the network matrix with the GIL-enabled interpreter:
 
-## Stream optimizations from ANALYSIS.md
+```bash
+taskset -c 2 target/bench-gil/bin/python benches/workload_matrix.py \
+  --loops asyncio,uvloop,zuvloop,rsloop \
+  --scenarios http_keepalive,tls_http,websocket_messages,websocket_tls \
+  --concurrency 16 --requests-per-connection 500 --warmups 2 --repeat 7 \
+  --json-output target/event-loops-97fa7cf-network.json
+```
+
+The churn CLI defaults to rsloop. To compare the same workload across all four
+factories, run this from the repository root with the GIL-enabled interpreter
+pinned to CPU 2:
+
+```python
+import asyncio
+import gc
+import statistics
+import sys
+sys.path.insert(0, "benches")
+from compare_event_loops import loop_factory_for
+from connection_churn import measure
+
+for name in ("asyncio", "uvloop", "zuvloop", "rsloop"):
+    gc.collect()
+    gc.disable()
+    try:
+        samples = [
+            asyncio.run(
+                asyncio.wait_for(measure(8000, 16), 120),
+                loop_factory=loop_factory_for(name),
+            )
+            for _ in range(9)
+        ][2:]
+    finally:
+        gc.enable()
+    print(name, statistics.median(samples) * 1000, "ms")
+```
+
+For the reader diagnostic:
+
+```bash
+taskset -c 2 target/bench-gil/bin/python benches/stream_read_lifecycle.py \
+  --rounds 100000 --repeat 7 --output target/event-loops-97fa7cf-reads.json
+```
+
+Local raw measurements, logs and build metadata from this refresh are in
+`target/benchmarks-refresh/`: `gil-one-core.json`, `gil-two-cores.json`,
+`free-threaded-one-core.json`, `network.json`, `churn-<loop>.json`, `reads.json`
+and `environment.json`. These are local build artifacts. All comparison
+columns and reader rows above are calculated directly from those samples.
+The subprocess memory regression and 34 other benchmark tooling tests pass.
+
+## Historical optimization measurements
+
+The sections below retain earlier before/after experiments against their named
+commits. Their numbers and implementation descriptions refer to those stages;
+the freshly measured all-loop comparisons above describe the current build.
+
+### Stream optimizations from ANALYSIS.md
 
 Measured October 14, 2026 against baseline commit `c9aa601`, using release
 builds of rsloop 0.1.64, CPython 3.14.7 with the GIL enabled, and Linux
@@ -196,7 +316,7 @@ Raw measurements from this session are saved in
 `target/analysis-{before,after}-{reads,network}.json` (local build artifacts).
 
 
-## Updated report: accept routing and runtime overhead
+### Updated report: accept routing and runtime overhead
 
 Measured October 14, 2026 against commit `4eb28e1` (which already contains the
 stream optimizations above). Both versions use rsloop 0.1.64 release builds,
@@ -294,7 +414,7 @@ its Python package with `PYTHONPATH`; the recorded native-module paths confirm
 the two measurements loaded different builds. Raw samples are saved locally
 in `target/report-v2-{before,after}-{loops,network,churn}.json`.
 
-## Completed performance-report implementation (October 14, 2026)
+### Completed performance-report implementation (October 14, 2026)
 
 Compared the release build at `2b9d618` with the completed report implementation
 on an Intel Core i9-9900K, Linux 7.0.0-38-generic, CPython 3.14.7 with the GIL,
@@ -328,12 +448,11 @@ per connection, the default HTTP body and WebSocket frame sizes, and warm
 measurement mode. TCP round trips use 1,024-byte payloads. Connection churn
 checks one-byte echoes on 8,000 newly opened connections at concurrency 16.
 
-The [implementation audit](report-implementation.md) covers all 55 report
-recommendations, tests, ownership constraints and platform verification limits.
+The completed implementation covers all 55 report recommendations.
 The allocation budget checks pass; Python suites pass on 3.10, 3.14 and
 free-threaded 3.14, alongside the default and optional-feature Rust suites.
 
-### Reproduction
+#### Reproduction
 
 Build `2b9d618` from an isolated archive with `maturin build --release --locked`,
 extract its wheel into a separate package directory, then run each command
