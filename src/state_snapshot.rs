@@ -118,6 +118,24 @@ mod tests {
     }
 
     #[test]
+    fn timed_wait_publishes_flags_and_returns_a_live_guard() {
+        let state = SnapshotMutex::new(State(0));
+        let cv = Condvar::new();
+        let mut guard = state.lock().unwrap();
+        guard.0 = 3;
+
+        let (mut guard, timeout) = state.wait_timeout(&cv, guard, Duration::ZERO).unwrap();
+        assert!(timeout.timed_out());
+        assert_eq!(state.flags(), 3);
+        assert_eq!(guard.0, 3);
+
+        guard.0 = 5;
+        drop(guard);
+        assert_eq!(state.flags(), 5);
+        assert_eq!(state.lock().unwrap().0, 5);
+    }
+
+    #[test]
     fn mutation_and_unwind_publish_flags_before_unlocking() {
         let state = SnapshotMutex::new(State(0));
         {
