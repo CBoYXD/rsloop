@@ -42,6 +42,8 @@ pub enum ReadyItem {
     // batch instead of one contended handoff per completion.
     #[cfg(unix)]
     ConnectCompleted(Box<ConnectCompletion>),
+    #[cfg(unix)]
+    LoopWork(Box<LoopWork>),
     Stop,
 }
 
@@ -49,6 +51,11 @@ pub enum ReadyItem {
 // payloads allocate separately; ordinary callbacks and stream-read/write
 // notifications remain allocation-free at the queue boundary.
 const _: () = assert!(std::mem::size_of::<ReadyItem>() <= 2 * std::mem::size_of::<usize>());
+
+/// The loop-thread half of work finished off the loop thread: it builds the
+/// Python result and settles a future, so the worker never takes the GIL.
+#[cfg(unix)]
+pub struct LoopWork(pub Box<dyn FnOnce(Python<'_>) -> PyResult<()> + Send>);
 
 pub struct FutureCompletion {
     pub future: Py<PyAny>,
@@ -178,6 +185,9 @@ pub enum LoopCommand {
         /// Error reported while waiting for writability, or zero.
         wait_errno: i32,
     },
+    /// Runs the loop-thread half of off-thread work.
+    #[cfg(unix)]
+    LoopWork(Box<LoopWork>),
     /// Requests that the active `run_forever` call return after ready work
     /// drains.
     RequestStop,

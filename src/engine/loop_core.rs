@@ -1049,6 +1049,8 @@ impl LoopCore {
                         } = *payload;
                         self.resolve_connect_completed(py, future, fd, wait_errno)?;
                     }
+                    #[cfg(unix)]
+                    ReadyItem::LoopWork(work) => (work.0)(py)?,
                 }
 
                 processed_this_turn += 1;
@@ -1701,6 +1703,8 @@ impl LoopCore {
                     ReadyItem::Callback(callback) => LoopCommand::ScheduleReady(callback),
                     ReadyItem::HandleCallback(handle) => LoopCommand::ScheduleReadyHandle(handle),
                     ReadyItem::Stop => LoopCommand::RequestStop,
+                    #[cfg(unix)]
+                    ReadyItem::LoopWork(work) => LoopCommand::LoopWork(work),
                     ReadyItem::FutureSetResult(payload) => {
                         let FutureCompletion { future, value } = *payload;
                         LoopCommand::Future(LoopFutureCommand::SetResult { future, value })
@@ -1874,6 +1878,14 @@ impl LoopCore {
                         }
                     }
                     _ => unreachable!("local connect completion enqueue preserves item kind"),
+                }),
+            #[cfg(unix)]
+            LoopCommand::LoopWork(work) => self
+                .try_enqueue_local_ready(ReadyItem::LoopWork(work))
+                .or_else(|item| self.try_enqueue_active_ready(item))
+                .map_err(|item| match item {
+                    ReadyItem::LoopWork(work) => LoopCommand::LoopWork(work),
+                    _ => unreachable!("local loop work enqueue preserves item kind"),
                 }),
             LoopCommand::RequestStop => self
                 .try_enqueue_local_ready(ReadyItem::Stop)

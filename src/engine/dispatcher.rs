@@ -536,6 +536,10 @@ impl RuntimeDispatcher {
                         wait_errno,
                     })));
             }
+            #[cfg(unix)]
+            LoopCommand::LoopWork(work) => {
+                self.ready_batch.push_back(ReadyItem::LoopWork(work));
+            }
             LoopCommand::RequestStop => {
                 self.ready_batch.push_back(ReadyItem::Stop);
             }
