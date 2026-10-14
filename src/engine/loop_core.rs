@@ -391,6 +391,11 @@ pub struct LoopCore {
     pending_timers: Mutex<BinaryHeap<TimerEntry>>,
     pending_timers_dirty: AtomicBool,
     cancelled_timers: Arc<AtomicUsize>,
+    /// Handles sent through the command channel that the dispatcher has not
+    /// yet moved into an active run's queue. While it is zero, an off-thread
+    /// handle may join the active queue directly without overtaking an
+    /// earlier handle from the same producer.
+    channel_handles: AtomicUsize,
     // Wakes the loop thread when a producer enqueues a ready item. Held in an
     // Shared with producers; the park future borrows it under `py.detach`.
     wake: Arc<LoopWake>,
@@ -425,6 +430,7 @@ impl LoopCore {
             pending_timers: Mutex::new(BinaryHeap::new()),
             pending_timers_dirty: AtomicBool::new(false),
             cancelled_timers: Arc::new(AtomicUsize::new(0)),
+            channel_handles: AtomicUsize::new(0),
             wake: Arc::new(LoopWake::new()),
         });
 
@@ -485,15 +491,36 @@ impl LoopCore {
             Ok(()) => return Ok(()),
             Err(item) => item,
         };
+        // Off the loop thread (call_soon_threadsafe from a server's I/O
+        // threads): join the active run's queue directly, one wake instead of
+        // a dispatcher-thread hop plus a second wake. Only while no handle is
+        // still on the command channel: one queued before EnterRun, or sent
+        // between runs, would otherwise be overtaken.
+        let item = if self.channel_handles.load(Ordering::Acquire) == 0 {
+            match self.try_enqueue_active_ready(item) {
+                Ok(()) => return Ok(()),
+                Err(item) => item,
+            }
+        } else {
+            item
+        };
         let ReadyItem::HandleCallback(handle) = item else {
             unreachable!("ready handle enqueue preserves item kind")
         };
-        // Keep every off-thread callback on the runtime command queue. During
-        // run_forever startup, callbacks queued before EnterRun already live
-        // there; sending later callbacks directly to pending_ready can overtake
-        // that older batch before the dispatcher processes EnterRun. The local
-        // loop-thread path above remains direct and allocation-free.
+        self.channel_handles.fetch_add(1, Ordering::AcqRel);
         self.send_remote_command(LoopCommand::ScheduleReadyHandle(handle))
+            .inspect_err(|_| {
+                self.channel_handles.fetch_sub(1, Ordering::AcqRel);
+            })
+    }
+
+    /// The dispatcher moved `count` channel handles into the active run's
+    /// queue; later handles may bypass the channel once none remain.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
+    pub(crate) fn channel_handles_forwarded(&self, count: usize) {
+        if count != 0 {
+            self.channel_handles.fetch_sub(count, Ordering::AcqRel);
+        }
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
