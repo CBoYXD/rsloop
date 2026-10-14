@@ -149,14 +149,16 @@ impl DeadlineHeap {
     #[inline]
     fn pop_expired(&mut self, now: Instant, output: &mut Vec<Waker>) {
         while self.deadline().is_some_and(|deadline| deadline <= now) {
-            let slab_index = self.heap[0];
-            let generation = self.entries[slab_index].generation;
-            if let Some(waker) = self.remove(TimerHandle {
-                slab_index,
-                generation,
-            }) {
-                output.push(waker);
+            let last = self.heap.len() - 1;
+            if last != 0 {
+                self.swap_nodes(0, last);
             }
+            let slab_index = self.heap.pop().expect("expired root exists");
+            let entry = self.entries.remove(slab_index);
+            if !self.heap.is_empty() {
+                self.sift_down(0);
+            }
+            output.push(entry.waker);
         }
     }
 }

@@ -137,7 +137,7 @@ fn new_socket(
 pub struct UnixStream {
     // Deregister before closing the socket (field declaration order).
     handle: InnerRawHandle,
-    inner: StdUnixStream,
+    inner: std::sync::Arc<StdUnixStream>,
 }
 
 /// A poll-only variant that always uses readiness-based operations.
@@ -239,6 +239,13 @@ impl UnixStream {
         inner: StdUnixStream,
         mode: RegistrationMode,
     ) -> Result<Self, io::Error> {
+        Self::from_shared_with_mode(std::sync::Arc::new(inner), mode)
+    }
+
+    fn from_shared_with_mode(
+        inner: std::sync::Arc<StdUnixStream>,
+        mode: RegistrationMode,
+    ) -> Result<Self, io::Error> {
         let handle = InnerRawHandle::new_with_mode(
             inner.as_raw_fd(),
             Interest::READABLE | Interest::WRITABLE,
@@ -291,6 +298,33 @@ impl PollUnixStream {
     pub fn from_std(inner: StdUnixStream) -> Result<Self, io::Error> {
         Ok(Self {
             stream: UnixStream::from_std_with_mode(inner, RegistrationMode::Poll)?,
+            read_ready: RefCell::new(false),
+            write_ready: RefCell::new(false),
+        })
+    }
+
+    /// Register a reader sharing the transport's socket allocation.
+    pub fn from_shared(inner: std::sync::Arc<StdUnixStream>) -> Result<Self, io::Error> {
+        Ok(Self {
+            stream: UnixStream::from_shared_with_mode(inner, RegistrationMode::Poll)?,
+            read_ready: RefCell::new(false),
+            write_ready: RefCell::new(false),
+        })
+    }
+
+    /// Register an endpoint whose nonblocking mode the transport established.
+    #[allow(dead_code, reason = "Used by the Python transport embedding")]
+    pub(crate) fn from_shared_nonblocking(
+        inner: std::sync::Arc<StdUnixStream>,
+    ) -> Result<Self, io::Error> {
+        let raw = inner.as_raw_fd();
+        let handle = InnerRawHandle::new_with_mode(
+            raw,
+            Interest::READABLE | Interest::WRITABLE,
+            RegistrationMode::Poll,
+        )?;
+        Ok(Self {
+            stream: UnixStream { inner, handle },
             read_ready: RefCell::new(false),
             write_ready: RefCell::new(false),
         })
@@ -456,7 +490,7 @@ impl TokioAsyncWrite for PollUnixStream {
         // std socket writes consume the borrowed IoSlice descriptors directly;
         // neither payload nor descriptor ownership crosses this poll.
         this.stream.handle.poll_io(cx, Interest::WRITABLE, || {
-            std::io::Write::write_vectored(&mut (&this.stream.inner), bufs)
+            std::io::Write::write_vectored(&mut this.stream.inner.as_ref(), bufs)
         })
     }
 
@@ -547,7 +581,13 @@ impl IntoRawFd for UnixStream {
     fn into_raw_fd(self) -> RawFd {
         let Self { handle, inner } = self;
         drop(handle);
-        inner.into_raw_fd()
+        match std::sync::Arc::try_unwrap(inner) {
+            Ok(inner) => inner.into_raw_fd(),
+            Err(shared) => shared
+                .try_clone()
+                .expect("duplicate shared Unix socket for ownership transfer")
+                .into_raw_fd(),
+        }
     }
 }
 

@@ -62,7 +62,7 @@ pub(super) fn iovec_count<T: TryFrom<usize>>(count: usize) -> io::Result<T> {
 }
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(super) fn iovec_to_system(bufs: &[crate::vibeio::io::IoVec]) -> Box<[libc::iovec]> {
     bufs.iter()
         .map(|buf| libc::iovec {
@@ -70,6 +70,75 @@ pub(super) fn iovec_to_system(bufs: &[crate::vibeio::io::IoVec]) -> Box<[libc::i
             iov_len: buf.len,
         })
         .collect()
+}
+
+// Synchronous calls consume descriptors immediately. Winsock also captures
+// WSABUF descriptors before an overlapped submission returns; only payloads
+// and OVERLAPPED must remain owned until acknowledgement. Linux completion
+// operations continue to use their separately retained boxed iovec arrays.
+#[cfg(unix)]
+type NativeIoVec = libc::iovec;
+#[cfg(windows)]
+type NativeIoVec = windows_sys::Win32::Networking::WinSock::WSABUF;
+
+pub(super) struct NativeIoVecs {
+    inline: [NativeIoVec; 16],
+    heap: Vec<NativeIoVec>,
+    len: usize,
+}
+
+impl NativeIoVecs {
+    pub(super) fn new(bufs: &[crate::vibeio::io::IoVec]) -> io::Result<Self> {
+        #[cfg(unix)]
+        let empty = libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        #[cfg(windows)]
+        let empty = NativeIoVec {
+            len: 0,
+            buf: std::ptr::null_mut(),
+        };
+        let mut storage = Self {
+            inline: [empty; 16],
+            heap: if bufs.len() > 16 {
+                Vec::with_capacity(bufs.len())
+            } else {
+                Vec::new()
+            },
+            len: bufs.len(),
+        };
+        for (index, buf) in bufs.iter().enumerate() {
+            #[cfg(unix)]
+            let descriptor = libc::iovec {
+                iov_base: buf.ptr.cast(),
+                iov_len: buf.len,
+            };
+            #[cfg(windows)]
+            let descriptor = NativeIoVec {
+                len: completion_len(buf.len)?,
+                buf: buf.ptr.cast(),
+            };
+            if bufs.len() <= 16 {
+                storage.inline[index] = descriptor;
+            } else {
+                storage.heap.push(descriptor);
+            }
+        }
+        Ok(storage)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn as_mut_ptr(&mut self) -> *mut NativeIoVec {
+        if self.len <= 16 {
+            self.inline.as_mut_ptr()
+        } else {
+            self.heap.as_mut_ptr()
+        }
+    }
 }
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
@@ -791,6 +860,44 @@ pub(crate) mod cancellation_tests {
                     weak.upgrade().is_none(),
                     "buffer retained after acknowledgement"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_descriptor_tests {
+    use super::*;
+    use crate::vibeio::io::IoVec;
+
+    #[test]
+    fn descriptors_preserve_payloads_across_inline_boundary() {
+        for count in [0, 1, 16, 17, 64] {
+            let mut bytes = vec![7u8; count];
+            let descriptors: Vec<_> = bytes
+                .iter_mut()
+                .map(|byte| IoVec {
+                    ptr: byte as *mut u8,
+                    len: 1,
+                })
+                .collect();
+            let mut storage = NativeIoVecs::new(&descriptors).unwrap();
+            assert_eq!(storage.len(), count);
+            assert_eq!(storage.heap.is_empty(), count <= 16);
+            // SAFETY: storage owns count initialized descriptors for this
+            // borrow.
+            let native = unsafe { std::slice::from_raw_parts(storage.as_mut_ptr(), count) };
+            for (native, source) in native.iter().zip(&descriptors) {
+                #[cfg(unix)]
+                {
+                    assert_eq!(native.iov_base, source.ptr.cast());
+                    assert_eq!(native.iov_len, source.len);
+                }
+                #[cfg(windows)]
+                {
+                    assert_eq!(native.buf, source.ptr.cast());
+                    assert_eq!(native.len as usize, source.len);
+                }
             }
         }
     }

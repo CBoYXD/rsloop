@@ -12,7 +12,7 @@
 //! use the `_nowait` form to keep teardown off the critical path.
 
 use std::{
-    io::{self, Read as _},
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -108,8 +108,7 @@ pub(super) fn run_stream_reader(
             }
         }
 
-        buf.resize(buf.capacity(), 0);
-        match reader.read(&mut buf) {
+        match reader.read_into_vec(&mut buf) {
             Ok(0) => {
                 core.enqueue_pending_read_event(PendingReadEvent::Eof);
                 return;
@@ -161,8 +160,7 @@ pub(super) fn spin_read_stream(
             return true;
         }
 
-        buf.resize(buf.capacity(), 0);
-        match reader.read(buf) {
+        match reader.read_into_vec(buf) {
             Ok(0) => {
                 core.enqueue_pending_read_event(PendingReadEvent::Eof);
                 return false;

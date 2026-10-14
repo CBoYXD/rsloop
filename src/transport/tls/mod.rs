@@ -28,6 +28,12 @@ const DEFAULT_HANDSHAKE_TIMEOUT_SECS: f64 = 60.0;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: f64 = 30.0;
 const CLIENT_CONFIG_CACHE_KEY: &str = "_rsloop_client_config_cache";
 
+struct CachedServerConfig {
+    generation: u64,
+    verify_mode: i32,
+    config: Arc<ServerConfig>,
+}
+
 struct CachedClientConfig {
     generation: u64,
     verify_mode: i32,
@@ -118,6 +124,41 @@ fn cached_client_config(py: Python<'_>, ssl_context: &Py<PyAny>) -> PyResult<Arc
 }
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
+fn cached_server_config(py: Python<'_>, ssl_context: &Py<PyAny>) -> PyResult<Arc<ServerConfig>> {
+    let context_dict = ssl_context.bind(py).getattr("__dict__")?;
+    let context_dict = context_dict.cast::<PyDict>()?;
+    let generation = context_dict
+        .get_item("_rsloop_tls_generation")?
+        .and_then(|value| value.extract::<u64>().ok())
+        .unwrap_or(0);
+    let verify_mode = verify_mode_value(py, ssl_context)?;
+    if let Some(value) = context_dict.get_item("_rsloop_server_config_cache")?
+        && let Ok(capsule) = value.cast::<PyCapsule>()
+        && let Ok(pointer) =
+            capsule.pointer_checked(Some(c_str!("rsloop._loop.server_config_cache")))
+    {
+        // SAFETY: the checked capsule name identifies our owned cache value;
+        // the context dictionary retains it while Python is attached.
+        let cached = unsafe { pointer.cast::<CachedServerConfig>().as_ref() };
+        if cached.generation == generation && cached.verify_mode == verify_mode {
+            return Ok(Arc::clone(&cached.config));
+        }
+    }
+    let config = Arc::new(build_server_config(py, ssl_context)?);
+    let cache = PyCapsule::new_with_value(
+        py,
+        CachedServerConfig {
+            generation,
+            verify_mode,
+            config: Arc::clone(&config),
+        },
+        c_str!("rsloop._loop.server_config_cache"),
+    )?;
+    context_dict.set_item("_rsloop_server_config_cache", cache)?;
+    Ok(config)
+}
+
+#[cfg_attr(feature = "profile", hotpath::measure)]
 pub fn server_tls_settings(
     py: Python<'_>,
     ssl: &Bound<'_, PyAny>,
@@ -125,12 +166,12 @@ pub fn server_tls_settings(
     ssl_shutdown_timeout: Option<f64>,
 ) -> PyResult<ServerTlsSettings> {
     let ssl_context = normalize_server_ssl_context(py, ssl)?;
-    let config = build_server_config(py, &ssl_context)?;
+    let config = cached_server_config(py, &ssl_context)?;
     let handshake_timeout = handshake_timeout(ssl_handshake_timeout)?;
     let shutdown_timeout = shutdown_timeout(ssl_shutdown_timeout)?;
 
     Ok(ServerTlsSettings {
-        config: Arc::new(config),
+        config,
         handshake_timeout,
         shutdown_timeout,
         ssl_context,

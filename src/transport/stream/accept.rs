@@ -53,8 +53,9 @@ pub(super) fn configure_accepted_tcp_stream(
     server: &Arc<ServerCore>,
     stream: &StdTcpStream,
     message: &str,
+    already_nonblocking: bool,
 ) -> bool {
-    if let Err(err) = stream.set_nonblocking(true) {
+    if !already_nonblocking && let Err(err) = stream.set_nonblocking(true) {
         server.report_error(PyRuntimeError::new_err(err.to_string()), message);
         return false;
     }
@@ -71,8 +72,9 @@ pub(super) fn configure_accepted_unix_stream(
     server: &Arc<ServerCore>,
     stream: &StdUnixStream,
     message: &str,
+    already_nonblocking: bool,
 ) -> bool {
-    if let Err(err) = stream.set_nonblocking(true) {
+    if !already_nonblocking && let Err(err) = stream.set_nonblocking(true) {
         server.report_error(PyRuntimeError::new_err(err.to_string()), message);
         return false;
     }
@@ -137,6 +139,7 @@ pub(super) fn spawn_accepted_tcp_transport(
     py: Python<'_>,
     server: &Arc<ServerCore>,
     stream: StdTcpStream,
+    ipv6: bool,
 ) -> PyResult<Py<PyStreamTransport>> {
     let protocol = server.create_protocol_with_py(py)?;
     let spawn_context = server_spawn_context(py, server, protocol);
@@ -145,13 +148,19 @@ pub(super) fn spawn_accepted_tcp_transport(
         spawn_tls_server_transport(
             py,
             spawn_context,
-            StreamKind::Tcp(stream),
+            StreamKind::Tcp(stream, super::builder::tcp_family(ipv6)),
             server_tls_settings(py, tls),
             server_ref,
             true,
         )
     } else {
-        spawn_tcp_transport(py, spawn_context, stream, server_ref)
+        spawn_tcp_transport(
+            py,
+            spawn_context,
+            stream,
+            server_ref,
+            super::builder::tcp_family(ipv6),
+        )
     }
 }
 
@@ -186,7 +195,7 @@ pub(crate) fn spawn_accepted_transport_with_py(
     stream: AcceptedStream,
 ) -> PyResult<Py<PyStreamTransport>> {
     match stream {
-        AcceptedStream::Tcp(stream) => spawn_accepted_tcp_transport(py, server, stream),
+        AcceptedStream::Tcp(stream, ipv6) => spawn_accepted_tcp_transport(py, server, stream, ipv6),
         #[cfg(unix)]
         AcceptedStream::Unix(stream) => spawn_accepted_unix_transport(py, server, stream),
     }
@@ -267,17 +276,18 @@ pub(super) fn run_tcp_accept_loop(params: BlockingAcceptLoop<StdTcpListener>) {
 
         loop {
             match listener.accept() {
-                Ok((stream, _addr)) => {
+                Ok((stream, addr)) => {
                     if !configure_accepted_tcp_stream(
                         &server,
                         &stream,
                         "failed to configure TCP connection",
+                        false,
                     ) {
                         continue;
                     }
                     schedule_accepted_transport(
                         &server,
-                        AcceptedStream::Tcp(stream),
+                        AcceptedStream::Tcp(stream, addr.is_ipv6()),
                         "failed to accept TCP connection",
                     );
                 }
@@ -374,12 +384,13 @@ pub(super) async fn run_windows_tcp_accept_lane(
                     &server,
                     &stream,
                     "failed to configure TCP connection",
+                    cfg!(all(unix, any(syscall_accept4, target_os = "linux"))),
                 ) {
                     continue;
                 }
                 schedule_accepted_transport(
                     &server,
-                    AcceptedStream::Tcp(stream),
+                    AcceptedStream::Tcp(stream, listener.is_ipv6()),
                     "failed to accept TCP connection",
                 );
             }
@@ -413,12 +424,13 @@ pub(super) async fn run_tcp_accept_lane(server: Arc<ServerCore>, listener: StdTc
                     &server,
                     &stream,
                     "failed to configure TCP connection",
+                    cfg!(all(unix, any(syscall_accept4, target_os = "linux"))),
                 ) {
                     continue;
                 }
                 schedule_accepted_transport(
                     &server,
-                    AcceptedStream::Tcp(stream),
+                    AcceptedStream::Tcp(stream, listener.is_ipv6()),
                     "failed to accept TCP connection",
                 );
             }
@@ -463,6 +475,7 @@ pub(super) fn run_unix_accept_loop(params: BlockingAcceptLoop<StdUnixListener>) 
                         &server,
                         &stream,
                         "failed to configure Unix connection",
+                        false,
                     ) {
                         continue;
                     }
@@ -504,6 +517,7 @@ pub(super) async fn run_unix_accept_task(server: Arc<ServerCore>, listener: StdU
                     &server,
                     &stream,
                     "failed to configure Unix connection",
+                    cfg!(any(syscall_accept4, target_os = "linux")),
                 ) {
                     continue;
                 }

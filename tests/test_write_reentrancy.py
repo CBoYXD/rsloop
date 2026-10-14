@@ -17,7 +17,9 @@ import rsloop
 @pytest.mark.parametrize("callback", ["pause", "resume"])
 @pytest.mark.parametrize("finish", ["close", "write_eof"])
 def test_flow_control_callback_preserves_unsent_data(callback, finish, method):
-    payload = bytes(range(256)) * (1024 if method == "writelines" else 272)
+    # Leave enough queued data to cross high water even after the first
+    # small write takes the immediate socket path.
+    payload = bytes(range(256)) * (1024 if method == "writelines" else 280)
 
     async def main():
         loop = asyncio.get_running_loop()
@@ -89,6 +91,40 @@ def test_flow_control_callback_preserves_unsent_data(callback, finish, method):
             else:
                 assert await asyncio.wait_for(finished, 5) > 0
                 assert await receive_all() == payload
+        finally:
+            if transport is not None:
+                transport.close()
+            sender.close()
+            receiver.close()
+
+    rsloop.run(main())
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="requires Unix transports")
+def test_isolated_small_protocol_write_is_delivered_immediately():
+    async def main():
+        loop = asyncio.get_running_loop()
+        sender, receiver = socket.socketpair()
+        sender.setblocking(False)
+        receiver.setblocking(False)
+        made = loop.create_future()
+        payload = b"single-message" * 16
+
+        class Sender(asyncio.Protocol):
+            def connection_made(self, transport):
+                try:
+                    transport.write(payload)
+                    # An isolated write must reach the socket in this callback,
+                    # without waiting for the event loop to flush a batch.
+                    assert receiver.recv(len(payload)) == payload
+                    made.set_result(transport)
+                except (AssertionError, OSError) as error:
+                    made.set_exception(error)
+
+        transport = None
+        try:
+            transport, _ = await loop.create_unix_connection(Sender, sock=sender)
+            assert await made is transport
         finally:
             if transport is not None:
                 transport.close()

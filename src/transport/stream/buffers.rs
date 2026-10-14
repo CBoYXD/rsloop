@@ -42,6 +42,10 @@ pub(super) struct OwnedReadBuffer {
 }
 
 impl OwnedReadBuffer {
+    pub(super) fn is_pooled(&self) -> bool {
+        self.pool.is_some()
+    }
+
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "OwnedReadBuffer"))]
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {

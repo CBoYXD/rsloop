@@ -37,7 +37,7 @@ use crate::fd_ops;
 pub(super) enum TaskedDirectWriter {
     Tcp(Arc<StdTcpStream>),
     #[cfg(unix)]
-    Unix(StdUnixStream),
+    Unix(Arc<StdUnixStream>),
 }
 
 impl TaskedDirectWriter {
@@ -82,10 +82,95 @@ pub enum ReaderTarget {
     File(std::fs::File),
     Tcp(Arc<StdTcpStream>),
     #[cfg(unix)]
-    Unix(StdUnixStream),
+    Unix(Arc<StdUnixStream>),
 }
 
 impl ReaderTarget {
+    /// Read directly into spare capacity. These concrete OS APIs initialize
+    /// exactly the returned prefix and never inspect uninitialized bytes.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ReaderTarget"))]
+    pub(super) fn read_into_vec(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        buf.clear();
+        let capacity = buf.capacity();
+        if capacity == 0 {
+            return Ok(0);
+        }
+        let destination = buf.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+        #[cfg(unix)]
+        let read = {
+            let count = capacity.min(isize::MAX as usize);
+            // SAFETY: the endpoint owns a live fd and the Vec exclusively
+            // owns this writable, possibly uninitialized range. read never
+            // reads from that range or retains the pointer.
+            let result = unsafe { libc::read(self.fd() as _, destination.cast(), count) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            result as usize
+        };
+        #[cfg(windows)]
+        let read = match self {
+            Self::Tcp(stream) => {
+                use std::os::windows::io::AsRawSocket;
+
+                use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, recv};
+                // SAFETY: the socket and exclusive destination remain live
+                // throughout this synchronous call; recv writes at most count.
+                let result = unsafe {
+                    recv(
+                        stream.as_raw_socket() as _,
+                        destination,
+                        capacity.min(i32::MAX as usize) as i32,
+                        0,
+                    )
+                };
+                if result < 0 {
+                    // SAFETY: reads only the calling thread's Winsock error
+                    // slot.
+                    return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+                }
+                result as usize
+            }
+            Self::File(file) => {
+                use std::os::windows::io::AsRawHandle;
+
+                use windows_sys::Win32::{
+                    Foundation::{ERROR_BROKEN_PIPE, GetLastError},
+                    Storage::FileSystem::ReadFile,
+                };
+                let mut count = 0;
+                // SAFETY: file is synchronous, so null OVERLAPPED retains no
+                // pointer; count and the exclusive Vec range are writable.
+                let result = unsafe {
+                    ReadFile(
+                        file.as_raw_handle() as _,
+                        destination,
+                        capacity.min(u32::MAX as usize) as u32,
+                        &mut count,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if result == 0 {
+                    // SAFETY: reads only the current thread's last-error slot.
+                    let error = unsafe { GetLastError() };
+                    if error == ERROR_BROKEN_PIPE {
+                        0
+                    } else {
+                        return Err(io::Error::from_raw_os_error(error as i32));
+                    }
+                } else {
+                    count as usize
+                }
+            }
+        };
+        // SAFETY: the synchronous OS operation initialized exactly this
+        // prefix, bounded above by the Vec's writable spare capacity.
+        unsafe {
+            buf.set_len(read);
+        }
+        Ok(read)
+    }
+
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ReaderTarget"))]
     pub(super) fn fd(&self) -> fd_ops::RawFd {
         match self {
@@ -119,7 +204,7 @@ impl Read for ReaderTarget {
             Self::File(file) => file.read(buf),
             Self::Tcp(stream) => stream.as_ref().read(buf),
             #[cfg(unix)]
-            Self::Unix(stream) => stream.read(buf),
+            Self::Unix(stream) => stream.as_ref().read(buf),
         }
     }
 }
@@ -200,7 +285,7 @@ impl WriterTarget {
 }
 
 pub(super) enum StreamKind {
-    Tcp(StdTcpStream),
+    Tcp(StdTcpStream, i32),
     #[cfg(unix)]
     Unix(StdUnixStream),
 }
@@ -209,7 +294,7 @@ impl StreamKind {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "StreamKind"))]
     pub(super) fn fd(&self) -> fd_ops::RawFd {
         match self {
-            Self::Tcp(stream) => tcp_stream_raw_fd(stream),
+            Self::Tcp(stream, _) => tcp_stream_raw_fd(stream),
             #[cfg(unix)]
             Self::Unix(stream) => unix_raw_fd(stream.as_raw_fd()),
         }
@@ -230,7 +315,7 @@ impl StreamKind {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "StreamKind"))]
     pub(super) fn shutdown_close(&self) -> io::Result<()> {
         match self {
-            Self::Tcp(stream) => shutdown_tcp_stream(stream, Shutdown::Both),
+            Self::Tcp(stream, _) => shutdown_tcp_stream(stream, Shutdown::Both),
             #[cfg(unix)]
             Self::Unix(stream) => shutdown_unix_stream(stream, Shutdown::Both),
         }
@@ -244,7 +329,7 @@ impl Read for StreamKind {
     )]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Tcp(stream) => stream.read(buf),
+            Self::Tcp(stream, _) => stream.read(buf),
             #[cfg(unix)]
             Self::Unix(stream) => stream.read(buf),
         }
@@ -258,7 +343,7 @@ impl io::Write for StreamKind {
     )]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Self::Tcp(stream) => stream.write(buf),
+            Self::Tcp(stream, _) => stream.write(buf),
             #[cfg(unix)]
             Self::Unix(stream) => stream.write(buf),
         }
@@ -270,7 +355,7 @@ impl io::Write for StreamKind {
     )]
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::Tcp(stream) => stream.flush(),
+            Self::Tcp(stream, _) => stream.flush(),
             #[cfg(unix)]
             Self::Unix(stream) => stream.flush(),
         }
@@ -399,5 +484,36 @@ mod shutdown_tests {
         assert!(super::is_no_buffer_space(
             &std::io::Error::from_raw_os_error(libc::ENOBUFS)
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod read_buffer_tests {
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn read_initializes_only_received_prefix_and_clears_stale_bytes() {
+        let (reader, mut writer) = StdUnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut target = ReaderTarget::Unix(Arc::new(reader));
+        let mut buffer = vec![99; 16384];
+        let address = buffer.as_ptr();
+        writer.write_all(b"first").unwrap();
+        assert_eq!(target.read_into_vec(&mut buffer).unwrap(), 5);
+        assert_eq!(buffer, b"first");
+        writer.write_all(b"x").unwrap();
+        assert_eq!(target.read_into_vec(&mut buffer).unwrap(), 1);
+        assert_eq!(buffer, b"x");
+        assert_eq!(buffer.as_ptr(), address);
+        assert_eq!(
+            target.read_into_vec(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(buffer.is_empty());
+        drop(writer);
+        assert_eq!(target.read_into_vec(&mut buffer).unwrap(), 0);
+        assert!(buffer.is_empty());
     }
 }

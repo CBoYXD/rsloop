@@ -29,7 +29,6 @@ use super::{
     builder::{
         StreamTransportStateConfig, fail_transport_worker_start, make_stream_extra, merge_extra,
         new_py_stream_transport, new_stream_transport_core, stream_transport_state_parts,
-        tcp_family,
     },
     io_targets::StreamKind,
     platform::tcp_stream_raw_fd,
@@ -194,8 +193,8 @@ pub(super) fn tls_stream_extra(
     extra_tls: HashMap<String, Py<PyAny>>,
 ) -> PyResult<HashMap<String, Py<PyAny>>> {
     match stream {
-        StreamKind::Tcp(stream) => Ok(merge_extra(
-            make_stream_extra(py, tcp_stream_raw_fd(stream), tcp_family(stream))?,
+        StreamKind::Tcp(stream, family) => Ok(merge_extra(
+            make_stream_extra(py, tcp_stream_raw_fd(stream), *family)?,
             extra_tls,
         )),
         #[cfg(unix)]

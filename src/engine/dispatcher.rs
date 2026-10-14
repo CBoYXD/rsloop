@@ -33,6 +33,98 @@ use super::{
 };
 use crate::fd_ops;
 
+/// One readiness wait on the native reactor. A duplicate protects cancellation
+/// from descriptor reuse while user code closes or replaces its registration.
+#[cfg_attr(feature = "profile", hotpath::measure(future = true))]
+async fn wait_fd_ready(fd: fd_ops::RawFd, writable: bool) -> std::io::Result<()> {
+    let (read, write) = fd_ops::poll_fd(fd, !writable, writable, 0)?;
+    if if writable { write } else { read } {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let duplicate = fd_ops::dup_raw_fd(fd)?;
+        // SAFETY: dup_raw_fd transfers a fresh owned Unix descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(duplicate as _) };
+        let interest = if writable {
+            mio::Interest::WRITABLE
+        } else {
+            mio::Interest::READABLE
+        };
+        let handle = crate::vibeio::InnerRawHandle::new_with_mode(
+            owned.as_raw_fd(),
+            interest,
+            crate::vibeio::RegistrationMode::Poll,
+        )?;
+        let mut armed = false;
+        std::future::poll_fn(|cx| {
+            if armed {
+                return Poll::Ready(Ok(()));
+            }
+            let mut op = if writable {
+                crate::vibeio::ReadinessOp::new_writable(&handle)
+            } else {
+                crate::vibeio::ReadinessOp::new_readable(&handle)
+            };
+            match handle.poll_op_poll(cx, &mut op) {
+                Poll::Pending => {
+                    armed = true;
+                    Poll::Pending
+                }
+                result => result,
+            }
+        })
+        .await
+    }
+    #[cfg(windows)]
+    {
+        // Winsock descriptors use native AFD readiness. CRT pipe/file handles
+        // retain the compatibility polling semantics with a timer, not a new
+        // worker thread for every event.
+        let interest = if writable {
+            mio::Interest::WRITABLE
+        } else {
+            mio::Interest::READABLE
+        };
+        if let Ok(handle) = crate::vibeio::InnerRawHandle::new_with_mode(
+            crate::vibeio::RawOsHandle::Socket(fd as _),
+            interest,
+            crate::vibeio::RegistrationMode::Poll,
+        ) {
+            let mut armed = false;
+            let result = std::future::poll_fn(|cx| {
+                if armed {
+                    return Poll::Ready(Ok(()));
+                }
+                let mut op = if writable {
+                    crate::vibeio::ReadinessOp::new_writable(&handle)
+                } else {
+                    crate::vibeio::ReadinessOp::new_readable(&handle)
+                };
+                match handle.poll_op_poll(cx, &mut op) {
+                    Poll::Pending => {
+                        armed = true;
+                        Poll::Pending
+                    }
+                    result => result,
+                }
+            })
+            .await;
+            if result.is_ok() {
+                return result;
+            }
+        }
+        loop {
+            let (read, write) = fd_ops::poll_fd(fd, !writable, writable, 0)?;
+            if if writable { write } else { read } {
+                return Ok(());
+            }
+            crate::vibeio::time::Sleep::new(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
 /// Long-lived future driven by the coordination thread's `vibeio` runtime.
 struct RuntimeDispatcher {
     core: Arc<LoopCore>,
@@ -328,24 +420,11 @@ impl RuntimeDispatcher {
                 }
 
                 let sender = Arc::clone(&self.core);
-                let task = WatchTask::spawn_thread(format!("rsloop-reader-{fd}"), move |stop| {
-                    loop {
-                        if stop.load(AtomicOrdering::Acquire) {
-                            return;
-                        }
-                        match fd_ops::poll_fd(fd, true, false, 50) {
-                            Ok((true, _)) => break,
-                            Ok((false, _)) => continue,
-                            Err(_) => return,
-                        }
+                let task = WatchTask::Vibeio(crate::vibeio::spawn(async move {
+                    if wait_fd_ready(fd, false).await.is_ok() && !callback.cancelled() {
+                        let _ = sender.send_command(LoopCommand::ScheduleReady(callback));
                     }
-
-                    if stop.load(AtomicOrdering::Acquire) || callback.cancelled() {
-                        return;
-                    }
-
-                    let _ = sender.send_command(LoopCommand::ScheduleReady(callback));
-                });
+                }));
 
                 self.reader_tasks.insert(fd, task);
             }
@@ -360,27 +439,11 @@ impl RuntimeDispatcher {
                 }
 
                 let sender = Arc::clone(&self.core);
-                let task = WatchTask::spawn_thread(
-                    format!("rsloop-writer-{fd}"),
-                    move |stop: Arc<AtomicBool>| {
-                        loop {
-                            if stop.load(AtomicOrdering::Acquire) {
-                                return;
-                            }
-                            match fd_ops::poll_fd(fd, false, true, 50) {
-                                Ok((false, true)) => break,
-                                Ok((false, false) | (true, _)) => continue,
-                                Err(_) => return,
-                            }
-                        }
-
-                        if stop.load(AtomicOrdering::Acquire) || callback.cancelled() {
-                            return;
-                        }
-
+                let task = WatchTask::Vibeio(crate::vibeio::spawn(async move {
+                    if wait_fd_ready(fd, true).await.is_ok() && !callback.cancelled() {
                         let _ = sender.send_command(LoopCommand::ScheduleReady(callback));
-                    },
-                );
+                    }
+                }));
 
                 self.writer_tasks.insert(fd, task);
             }
@@ -449,7 +512,7 @@ impl RuntimeDispatcher {
                 // not cancel) the running task.
                 let core = Arc::clone(&self.core);
                 std::mem::drop(crate::vibeio::spawn(
-                    crate::transport::stream::run_connect_watch_task(core, fd, future),
+                    crate::transport::stream::run_connect_watch_task(core, fd, future, None, None),
                 ));
             }
             #[cfg(unix)]

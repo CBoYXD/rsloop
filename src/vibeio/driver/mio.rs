@@ -80,6 +80,7 @@ impl DriverWaker {
 struct DriverWaker {
     sender: UnixDatagram,
     receiver: UnixDatagram,
+    notified: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -95,26 +96,41 @@ impl DriverWaker {
             WAKE_TOKEN,
             Interest::READABLE,
         )?;
-        Ok(Self { sender, receiver })
+        Ok(Self {
+            sender,
+            receiver,
+            notified: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "DriverWaker"))]
     #[inline]
     fn wake(&self) -> io::Result<()> {
-        super::send_wake_notification(|| self.sender.send(&[1]))
+        use std::sync::atomic::Ordering;
+        if self.notified.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = super::send_wake_notification(|| self.sender.send(&[1]));
+        if result.is_err() {
+            self.notified.store(false, Ordering::Release);
+        }
+        result
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "DriverWaker"))]
     fn acknowledge(&self) {
-        let mut buffer = [0_u8; 256];
+        // Keep the flag set until the single pending datagram is consumed.
+        // Clearing it before recv would permit a second datagram and break
+        // the one-recv invariant on an edge-triggered selector.
+        let mut byte = [0_u8; 1];
         loop {
-            match self.receiver.recv(&mut buffer) {
-                Ok(_) => {}
+            match self.receiver.recv(&mut byte) {
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                Err(err) if err.kind() == ErrorKind::WouldBlock => return,
-                Err(_) => return,
+                _ => break,
             }
         }
+        self.notified
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -146,6 +162,17 @@ impl MioDriver {
         if let Some(registration) = self.state.borrow_mut().registrations.get_mut(token.0) {
             registration.unclaimed_readiness = false;
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_unclaimed_readiness(&self, token: Token) -> bool {
+        self.state
+            .borrow_mut()
+            .registrations
+            .get_mut(token.0)
+            .is_some_and(|registration| {
+                registration.read_closed || std::mem::take(&mut registration.unclaimed_readiness)
+            })
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "MioDriver"))]

@@ -346,3 +346,30 @@ def test_retained_token_prevents_reuse_of_an_empty_callback_context(factory):
             loop.close()
 
     contextvars.Context().run(scenario)
+
+
+@pytest.mark.parametrize("factory", [asyncio.new_event_loop, rsloop.new_event_loop])
+@pytest.mark.parametrize("argument_count", [0, 1, 3])
+def test_callback_result_finalizer_runs_after_context_exit(factory, argument_count):
+    variable = contextvars.ContextVar("result_finalizer", default="ambient")
+    callback_context = contextvars.Context()
+    callback_context.run(variable.set, "callback")
+    events = []
+
+    class Result:
+        def __del__(self):
+            events.append(("finalizer", variable.get()))
+
+    def callback(*args):
+        assert args == tuple(range(argument_count))
+        events.append(("callback", variable.get()))
+        return Result()
+
+    loop = factory()
+    try:
+        loop.call_soon(callback, *range(argument_count), context=callback_context)
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+        assert events == [("callback", "callback"), ("finalizer", "ambient")]
+    finally:
+        loop.close()

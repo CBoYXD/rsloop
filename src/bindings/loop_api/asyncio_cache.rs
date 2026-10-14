@@ -14,6 +14,125 @@ use super::ffi_helpers;
 #[cfg(any(Py_3_12, all(Py_3_11, not(Py_LIMITED_API))))]
 use crate::python_names;
 
+macro_rules! cached_function {
+    ($name:ident, $module:literal, $attribute:literal) => {
+        #[cfg_attr(feature = "profile", hotpath::measure)]
+        pub(super) fn $name(py: Python<'_>) -> PyResult<&Py<PyAny>> {
+            static CACHE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+            CACHE.get_or_try_init(py, || Ok(py.import($module)?.getattr($attribute)?.unbind()))
+        }
+    };
+}
+cached_function!(isfuture_fn, "asyncio", "isfuture");
+cached_function!(ensure_future_fn, "asyncio", "ensure_future");
+cached_function!(get_asyncgen_hooks_fn, "sys", "get_asyncgen_hooks");
+cached_function!(set_asyncgen_hooks_fn, "sys", "set_asyncgen_hooks");
+cached_function!(
+    firstiter_hook_fn,
+    "rsloop._loop",
+    "_asyncgen_firstiter_hook"
+);
+cached_function!(
+    finalizer_hook_fn,
+    "rsloop._loop",
+    "_asyncgen_finalizer_hook"
+);
+cached_function!(future_done_stop_fn, "rsloop._loop", "future_done_stop");
+
+#[pyfunction]
+fn loop_reference_gone(_reference: &Bound<'_, PyAny>) {}
+
+#[pyclass(module = "rsloop._loop")]
+struct LoopBoundCallback {
+    loop_ref: Py<pyo3::types::PyWeakrefReference>,
+    function: Py<PyAny>,
+}
+#[pymethods]
+impl LoopBoundCallback {
+    fn __call__(&self, py: Python<'_>, arg: &Bound<'_, PyAny>) -> PyResult<()> {
+        use pyo3::types::PyWeakrefMethods;
+        if let Some(loop_obj) = self.loop_ref.bind(py).upgrade() {
+            self.function.call1(py, (loop_obj, arg))?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn loop_bound_callback(
+    py: Python<'_>,
+    core: &crate::engine::LoopCore,
+    loop_obj: &Py<PyAny>,
+    index: usize,
+) -> PyResult<Py<PyAny>> {
+    if let Some(callbacks) = &core
+        .state
+        .lock()
+        .expect("poisoned loop state")
+        .bound_callbacks
+    {
+        return Ok(callbacks[index].clone_ref(py));
+    }
+    static WEAKREF_CALLBACK: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let weakref_callback = WEAKREF_CALLBACK.get_or_try_init(py, || {
+        Ok::<_, PyErr>(
+            pyo3::wrap_pyfunction!(loop_reference_gone, py)?
+                .unbind()
+                .into_any(),
+        )
+    })?;
+    let functions = [
+        firstiter_hook_fn(py)?,
+        finalizer_hook_fn(py)?,
+        future_done_stop_fn(py)?,
+    ];
+    let mut callbacks = Vec::with_capacity(3);
+    for function in functions {
+        callbacks.push(
+            Py::new(
+                py,
+                LoopBoundCallback {
+                    loop_ref: pyo3::types::PyWeakrefReference::new_with(
+                        loop_obj.bind(py),
+                        weakref_callback.bind(py),
+                    )?
+                    .unbind(),
+                    function: function.clone_ref(py),
+                },
+            )?
+            .into_any(),
+        );
+    }
+    let callbacks: [Py<PyAny>; 3] = callbacks.try_into().ok().expect("three callbacks");
+    let mut state = core.state.lock().expect("poisoned loop state");
+    let callbacks = state.bound_callbacks.get_or_insert(callbacks);
+    Ok(callbacks[index].clone_ref(py))
+}
+
+pub(super) fn ensure_future<'py>(
+    py: Python<'py>,
+    future: &Py<PyAny>,
+    loop_obj: &Py<PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    static KEYWORDS: PyOnceLock<Py<pyo3::types::PyTuple>> = PyOnceLock::new();
+    let keywords = KEYWORDS.get_or_try_init(py, || {
+        pyo3::types::PyTuple::new(py, [pyo3::intern!(py, "loop")]).map(Bound::unbind)
+    })?;
+    let args = [future.as_ptr(), loop_obj.as_ptr()];
+    // SAFETY: callable, values and keyword tuple are live under Python. One
+    // positional and one keyword value match the two-element argument array.
+    unsafe {
+        Bound::from_owned_ptr_or_err(
+            py,
+            pyo3::ffi::PyObject_Vectorcall(
+                ensure_future_fn(py)?.as_ptr(),
+                args.as_ptr(),
+                1,
+                keywords.as_ptr(),
+            ),
+        )
+    }
+}
+
 struct PythonApiCaches {
     asyncio_task_cls: PyOnceLock<Py<PyAny>>,
     asyncio_future_cls: PyOnceLock<Py<PyAny>>,

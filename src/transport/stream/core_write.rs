@@ -139,10 +139,7 @@ impl StreamTransportCore {
     )]
     #[inline]
     pub(super) fn write_backpressure_active(&self) -> bool {
-        self.state
-            .lock()
-            .expect("poisoned transport state")
-            .writer_registered
+        self.state.flags() & 4 != 0
     }
 
     #[cfg_attr(
@@ -201,7 +198,7 @@ impl StreamTransportCore {
                 stream.as_ref().write(data)
             }
             #[cfg(unix)]
-            TaskedDirectWriter::Unix(stream) => stream.write(data),
+            TaskedDirectWriter::Unix(stream) => stream.as_ref().write(data),
         }
     }
 
@@ -400,8 +397,8 @@ impl StreamTransportCore {
         hotpath::measure(impl_type = "StreamTransportCore")
     )]
     pub(super) fn write_status(&self) -> (bool, bool, bool) {
-        let state = self.state.lock().expect("poisoned transport state");
-        (state.closing, state.writable, state.writer_registered)
+        let flags = self.state.flags();
+        (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0)
     }
 
     #[cfg_attr(
@@ -410,6 +407,22 @@ impl StreamTransportCore {
     )]
     pub(super) fn try_write_bytes(self: &Arc<Self>, bytes: &Bound<'_, PyBytes>) -> io::Result<()> {
         self.try_write_bytes_with_status(bytes, self.write_backpressure_active())
+    }
+
+    /// Learn whether this connection emits batches. The first isolated write
+    /// stays direct; a repeated write stages the tail and predicts batching on
+    /// the next turn, so recurring header/body pairs still coalesce together.
+    fn should_coalesce_small_write(&self, len: usize) -> bool {
+        if !self.coalesce_small_writes || !is_write_batch_candidate(len) {
+            return false;
+        }
+        let turn = self.loop_core.current_turn();
+        if self.small_write_turn.swap(turn, Ordering::Relaxed) == turn {
+            self.small_writes_this_turn.store(2, Ordering::Relaxed);
+            true
+        } else {
+            self.small_writes_this_turn.swap(1, Ordering::Relaxed) > 1
+        }
     }
 
     pub(super) fn try_write_bytes_with_status(
@@ -434,9 +447,8 @@ impl StreamTransportCore {
         }
 
         if self.direct_writer.is_some() && !backpressure_active {
-            if self.direct_write_scheduled.load(Ordering::Acquire)
-                || (self.coalesce_small_writes && is_write_batch_candidate(data.len()))
-            {
+            let coalesce = self.should_coalesce_small_write(data.len());
+            if self.direct_write_scheduled.load(Ordering::Acquire) || coalesce {
                 return self.stage_direct_write_buffer(OwnedWriteBuffer::from_python(bytes));
             }
             match self.try_direct_tasked_write(data) {
@@ -591,7 +603,7 @@ impl StreamTransportCore {
             .expect("poisoned direct tasked writer");
         match writer.as_mut() {
             Some(TaskedDirectWriter::Tcp(stream)) => stream.as_ref().write_vectored(data),
-            Some(TaskedDirectWriter::Unix(stream)) => stream.write_vectored(data),
+            Some(TaskedDirectWriter::Unix(stream)) => stream.as_ref().write_vectored(data),
             None => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "direct writer is closed",
@@ -735,10 +747,10 @@ impl StreamTransportCore {
         let stream = if family == libc::AF_UNIX {
             StreamKind::Unix(unix_stream_from_owned_socket_fd(fd)?)
         } else {
-            StreamKind::Tcp(tcp_stream_from_owned_socket_fd(fd)?)
+            StreamKind::Tcp(tcp_stream_from_owned_socket_fd(fd)?, family)
         };
         #[cfg(not(unix))]
-        let stream = StreamKind::Tcp(tcp_stream_from_owned_socket_fd(fd)?);
+        let stream = StreamKind::Tcp(tcp_stream_from_owned_socket_fd(fd)?, family);
 
         Ok((
             TransportSpawnContext::new(

@@ -31,7 +31,6 @@ use super::{
     builder::{
         StreamTransportStateConfig, detached_socket_handle, fail_transport_worker_start,
         new_py_stream_transport, new_stream_transport_core, stream_transport_state_parts,
-        tcp_family,
     },
     io_targets::{
         LazyWriterConfig, LazyWriterTarget, ReaderTarget, StreamKind, TaskedDirectWriter,
@@ -72,6 +71,7 @@ pub fn transport_from_socket(
         spawn_context,
         tcp_stream_from_owned_socket_fd(fd)?,
         None,
+        family,
     )
 }
 
@@ -101,7 +101,7 @@ pub fn transport_from_socket_tls(
     spawn_tls_client_transport(
         py,
         spawn_context,
-        StreamKind::Tcp(tcp_stream_from_owned_socket_fd(fd)?),
+        StreamKind::Tcp(tcp_stream_from_owned_socket_fd(fd)?, family),
         tls,
         None,
         true,
@@ -134,7 +134,7 @@ pub fn transport_from_socket_server_tls(
     spawn_tls_server_transport(
         py,
         spawn_context,
-        StreamKind::Tcp(tcp_stream_from_owned_socket_fd(fd)?),
+        StreamKind::Tcp(tcp_stream_from_owned_socket_fd(fd)?, family),
         tls,
         None,
         true,
@@ -215,9 +215,9 @@ pub fn spawn_tcp_transport(
     mut spawn_context: TransportSpawnContext,
     stream: StdTcpStream,
     server: Option<Weak<ServerCore>>,
+    family: i32,
 ) -> PyResult<Py<PyStreamTransport>> {
     let raw_fd = tcp_stream_raw_fd(&stream);
-    let family = tcp_family(&stream);
     let extra = HashMap::new();
     let callbacks = build_protocol_callbacks(py, &spawn_context.protocol)?;
     spawn_context.context_needs_run &= callbacks.stream_reader_fast_path.is_none();
@@ -276,7 +276,8 @@ pub fn spawn_unix_transport(
     let extra = HashMap::new();
     let callbacks = build_protocol_callbacks(py, &spawn_context.protocol)?;
     spawn_context.context_needs_run &= callbacks.stream_reader_fast_path.is_none();
-    let direct_writer = duplicate_unix_direct_writer(raw_fd)?;
+    let stream = Arc::new(stream);
+    let direct_writer = Arc::clone(&stream);
     let (writer_tx, writer_rx) = writer_channel();
     let parts = stream_transport_state_parts(
         spawn_context,

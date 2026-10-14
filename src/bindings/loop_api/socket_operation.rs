@@ -47,15 +47,19 @@ impl SocketAction {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "SocketAction"))]
     fn attempt(&mut self, py: Python<'_>, socket: &Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
         let result = match self {
-            Self::Recv(count) => socket.call_method1(py, "recv", (*count,)),
-            Self::RecvInto(buffer) => socket.call_method1(py, "recv_into", (buffer.bind(py),)),
-            Self::Accept => socket.call_method0(py, "accept").and_then(|accepted| {
-                accepted
-                    .bind(py)
-                    .get_item(0)?
-                    .call_method1("setblocking", (false,))?;
-                Ok(accepted)
-            }),
+            Self::Recv(count) => socket.call_method1(py, crate::python_names::recv(py), (*count,)),
+            Self::RecvInto(buffer) => {
+                socket.call_method1(py, crate::python_names::recv_into(py), (buffer.bind(py),))
+            }
+            Self::Accept => socket
+                .call_method0(py, crate::python_names::accept(py))
+                .and_then(|accepted| {
+                    accepted
+                        .bind(py)
+                        .get_item(0)?
+                        .call_method1(crate::python_names::setblocking(py), (false,))?;
+                    Ok(accepted)
+                }),
             Self::SendAll { data, offset, len } => {
                 // Bound synchronous progress so a large writable socket cannot
                 // monopolize the loop. Only the remaining memoryview is sliced;
@@ -87,7 +91,7 @@ impl SocketAction {
                             1,
                         ))?
                     };
-                    match socket.call_method1(py, "send", (chunk,)) {
+                    match socket.call_method1(py, crate::python_names::send(py), (chunk,)) {
                         Ok(count) => {
                             let count: usize = count.extract(py)?;
                             if count == 0 || count > len.saturating_sub(*offset) {
@@ -128,6 +132,7 @@ struct WakeState {
     done: AtomicBool,
     waker: AtomicWaker,
     error: Mutex<Option<io::Error>>,
+    request: Mutex<Option<Arc<ReadyCallback>>>,
 }
 
 #[pyclass(frozen)]
@@ -150,6 +155,8 @@ struct SocketOperation {
     action: SocketAction,
     context: Py<PyAny>,
     wake: Arc<WakeState>,
+    duplicate: Option<Arc<socket2::Socket>>,
+    service_started: bool,
 }
 
 #[pymethods]
@@ -170,7 +177,7 @@ pub(super) fn start<'py>(
     // An immediate syscall must never block the owning loop. This is also
     // checked for wrapped sockets so their methods retain the same contract.
     if socket
-        .call_method0(py, "gettimeout")?
+        .call_method0(py, crate::python_names::gettimeout(py))?
         .extract::<Option<f64>>(py)?
         != Some(0.0)
     {
@@ -184,10 +191,14 @@ pub(super) fn start<'py>(
     };
     match action.attempt(py, &socket) {
         Ok(Some(value)) => {
-            future.call_method1(py, "set_result", (value,))?;
+            future.call_method1(py, crate::python_names::set_result(py), (value,))?;
         }
         Err(error) => {
-            future.call_method1(py, "set_exception", (error.into_value(py),))?;
+            future.call_method1(
+                py,
+                crate::python_names::set_exception(py),
+                (error.into_value(py),),
+            )?;
         }
         Ok(None) => {
             let core = slf.borrow(py).core.clone();
@@ -202,9 +213,15 @@ pub(super) fn start<'py>(
                     action,
                     context,
                     wake: wake.clone(),
+                    duplicate: None,
+                    service_started: false,
                 },
             )?;
-            future.call_method1(py, "add_done_callback", (Py::new(py, CancelWait(wake))?,))?;
+            future.call_method1(
+                py,
+                crate::python_names::add_done_callback(py),
+                (Py::new(py, CancelWait(wake))?,),
+            )?;
             if core.on_runtime_thread() {
                 arm_wait(py, operation)?;
             } else {
@@ -226,7 +243,11 @@ pub(super) fn start<'py>(
 #[cfg_attr(feature = "profile", hotpath::measure)]
 fn poll_operation(py: Python<'_>, operation: Py<SocketOperation>) -> PyResult<()> {
     let mut op = operation.borrow_mut(py);
-    if op.future.call_method0(py, "done")?.extract::<bool>(py)? {
+    if op
+        .future
+        .call_method0(py, crate::python_names::done(py))?
+        .extract::<bool>(py)?
+    {
         return Ok(());
     }
     let error = op
@@ -243,11 +264,15 @@ fn poll_operation(py: Python<'_>, operation: Py<SocketOperation>) -> PyResult<()
     };
     match result {
         Ok(Some(value)) => {
-            op.future.call_method1(py, "set_result", (value,))?;
+            op.future
+                .call_method1(py, crate::python_names::set_result(py), (value,))?;
         }
         Err(error) => {
-            op.future
-                .call_method1(py, "set_exception", (error.into_value(py),))?;
+            op.future.call_method1(
+                py,
+                crate::python_names::set_exception(py),
+                (error.into_value(py),),
+            )?;
         }
         Ok(None) => {
             drop(op);
@@ -280,20 +305,32 @@ fn duplicate_socket(py: Python<'_>, socket: &Py<PyAny>) -> PyResult<socket2::Soc
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
 fn arm_wait(py: Python<'_>, operation: Py<SocketOperation>) -> PyResult<()> {
-    let op = operation.borrow(py);
-    let duplicate = match duplicate_socket(py, &op.socket) {
-        Ok(socket) => socket,
-        Err(error) => {
-            op.future
-                .call_method1(py, "set_exception", (error.into_value(py),))?;
-            return Ok(());
+    let mut op = operation.borrow_mut(py);
+    if op.duplicate.is_none() {
+        match duplicate_socket(py, &op.socket) {
+            Ok(socket) => op.duplicate = Some(Arc::new(socket)),
+            Err(error) => {
+                op.future.call_method1(
+                    py,
+                    crate::python_names::set_exception(py),
+                    (error.into_value(py),),
+                )?;
+                return Ok(());
+            }
         }
-    };
+    }
+    let duplicate = op
+        .duplicate
+        .as_ref()
+        .expect("initialized wait socket")
+        .clone();
     let core = op.core.clone();
     let wake = op.wake.clone();
     let writable = op.action.writable();
     let context = op.context.clone_ref(py);
     let future = op.future.clone_ref(py);
+    let start_service = !op.service_started;
+    op.service_started = true;
     drop(op);
     let ready = Arc::new(ReadyCallback::from_args(
         core.next_callback_id(),
@@ -303,23 +340,54 @@ fn arm_wait(py: Python<'_>, operation: Py<SocketOperation>) -> PyResult<()> {
         context,
         true,
     ));
-    if !core.spawn_io(wait_socket(core.clone(), duplicate, writable, wake, ready)) {
+    *wake.request.lock().expect("poisoned socket wait request") = Some(ready);
+    wake.waker.wake();
+    if start_service
+        && !core.spawn_io(wait_socket(
+            core.clone(),
+            duplicate,
+            writable,
+            wake.clone(),
+            RequestCleanup(wake.clone()),
+        ))
+    {
+        let pending = wake
+            .request
+            .lock()
+            .expect("poisoned socket wait request")
+            .take();
+        drop(pending);
         future.call_method1(
             py,
-            "set_exception",
+            crate::python_names::set_exception(py),
             (PyRuntimeError::new_err("socket wait has no running loop").into_value(py),),
         )?;
     }
     Ok(())
 }
 
+/// Break a queued callback -> operation -> wait-state reference cycle even
+/// when the service future is cancelled before its first poll.
+struct RequestCleanup(Arc<WakeState>);
+impl Drop for RequestCleanup {
+    fn drop(&mut self) {
+        let pending = self
+            .0
+            .request
+            .lock()
+            .expect("poisoned socket wait request")
+            .take();
+        drop(pending);
+    }
+}
+
 #[cfg_attr(feature = "profile", hotpath::measure(future = true))]
 async fn wait_socket(
     core: Arc<LoopCore>,
-    socket: socket2::Socket,
+    socket: Arc<socket2::Socket>,
     writable: bool,
     wake: Arc<WakeState>,
-    ready: Arc<ReadyCallback>,
+    _cleanup: RequestCleanup,
 ) {
     #[cfg(unix)]
     let raw = {
@@ -336,40 +404,67 @@ async fn wait_socket(
     } else {
         mio::Interest::READABLE
     };
-    let result = match InnerRawHandle::new_with_mode(raw, interest, RegistrationMode::Poll) {
-        Err(error) => Err(error),
-        Ok(handle) => {
-            let mut armed = false;
-            poll_fn(|cx| {
-                wake.waker.register(cx.waker());
-                if wake.done.load(Ordering::Acquire) {
-                    return Poll::Ready(Ok(false));
-                }
-                // Readiness is advisory: any later retry still calls the Python
-                // socket and can arm another wait after a spurious
-                // notification.
-                if armed {
-                    return Poll::Ready(Ok(true));
-                }
-                let mut op = if writable {
-                    ReadinessOp::new_writable(&handle)
-                } else {
-                    ReadinessOp::new_readable(&handle)
-                };
-                armed = true;
-                handle
-                    .poll_op_poll(cx, &mut op)
-                    .map(|result| result.map(|()| true))
-            })
-            .await
-            // handle deregisters before the duplicate is closed, on its owner.
+    let handle = InnerRawHandle::new_with_mode(raw, interest, RegistrationMode::Poll);
+    loop {
+        let ready = poll_fn(|cx| {
+            wake.waker.register(cx.waker());
+            if wake.done.load(Ordering::Acquire) {
+                return Poll::Ready(None);
+            }
+            match wake
+                .request
+                .lock()
+                .expect("poisoned socket wait request")
+                .take()
+            {
+                Some(ready) => Poll::Ready(Some(ready)),
+                None => Poll::Pending,
+            }
+        })
+        .await;
+        let Some(ready) = ready else {
+            return;
+        };
+        let result = match &handle {
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+            Ok(handle) => {
+                let mut armed = false;
+                poll_fn(|cx| {
+                    wake.waker.register(cx.waker());
+                    if wake.done.load(Ordering::Acquire) {
+                        return Poll::Ready(Ok(false));
+                    }
+                    if armed {
+                        return Poll::Ready(Ok(true));
+                    }
+                    let mut op = if writable {
+                        ReadinessOp::new_writable(handle)
+                    } else {
+                        ReadinessOp::new_readable(handle)
+                    };
+                    armed = true;
+                    handle
+                        .poll_op_poll(cx, &mut op)
+                        .map(|result| result.map(|()| true))
+                })
+                .await
+            }
+        };
+        if wake.done.load(Ordering::Acquire) {
+            return;
         }
-    };
-    drop(socket);
-    if !wake.done.load(Ordering::Acquire) {
+        let failed = result.is_err();
         if let Err(error) = result {
             *wake.error.lock().expect("poisoned socket wait error") = Some(error);
         }
-        let _ = core.send_command(LoopCommand::ScheduleReady(ready));
+        if core
+            .send_command(LoopCommand::ScheduleReady(ready))
+            .is_err()
+            || failed
+        {
+            return;
+        }
+        // The registration and duplicate survive the Python retry. A new
+        // request rearms this service; cancellation releases both immediately.
     }
 }

@@ -26,6 +26,7 @@ mod platform;
 mod profile;
 mod python_names;
 pub mod rust_async;
+mod state_snapshot;
 mod transport;
 #[cfg(kani)]
 mod verification;

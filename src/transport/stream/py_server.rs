@@ -45,7 +45,7 @@ impl PyServer {
             loop {
                 if core.is_closed()
                     && core.active_accept_tasks.load(Ordering::Acquire) == 0
-                    && core.active_connections.load(Ordering::SeqCst) == 0
+                    && core.active_connections.load(Ordering::Acquire) == 0
                     && core.pending_tls_handshakes.load(Ordering::Acquire) == 0
                 {
                     return Ok(Python::attach(|py| py.None()));
@@ -53,7 +53,7 @@ impl PyServer {
                 let wait = core.closed_notify.listen();
                 if core.is_closed()
                     && core.active_accept_tasks.load(Ordering::Acquire) == 0
-                    && core.active_connections.load(Ordering::SeqCst) == 0
+                    && core.active_connections.load(Ordering::Acquire) == 0
                     && core.pending_tls_handshakes.load(Ordering::Acquire) == 0
                 {
                     return Ok(Python::attach(|py| py.None()));

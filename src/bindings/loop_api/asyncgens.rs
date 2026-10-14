@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use pyo3::{
     prelude::*,
-    types::{PyDict, PyModule, PySet, PyWeakrefMethods, PyWeakrefReference},
+    types::{PyDict, PySet, PyWeakrefMethods, PyWeakrefReference},
 };
 
 use super::PyLoop;
@@ -33,24 +33,12 @@ impl AsyncgenHooksGuard {
         loop_obj: &Py<PyAny>,
         core: &Arc<LoopCore>,
     ) -> PyResult<Self> {
-        let sys = py.import("sys")?;
-        let hooks = sys.call_method0("get_asyncgen_hooks")?;
-        let old_firstiter = hooks.getattr("firstiter")?.unbind();
-        let old_finalizer = hooks.getattr("finalizer")?.unbind();
-        let helper_mod = PyModule::import(py, "rsloop._loop")?;
-        let functools = py.import("functools")?;
-        let firstiter = functools.getattr("partial")?.call1((
-            helper_mod.getattr("_asyncgen_firstiter_hook")?,
-            loop_obj.clone_ref(py),
-        ))?;
-        let finalizer = functools.getattr("partial")?.call1((
-            helper_mod.getattr("_asyncgen_finalizer_hook")?,
-            loop_obj.clone_ref(py),
-        ))?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("firstiter", firstiter)?;
-        kwargs.set_item("finalizer", finalizer)?;
-        sys.call_method("set_asyncgen_hooks", (), Some(&kwargs))?;
+        let hooks = super::asyncio_cache::get_asyncgen_hooks_fn(py)?.call0(py)?;
+        let old_firstiter = hooks.getattr(py, "firstiter")?;
+        let old_finalizer = hooks.getattr(py, "finalizer")?;
+        let firstiter = super::asyncio_cache::loop_bound_callback(py, core, loop_obj, 0)?;
+        let finalizer = super::asyncio_cache::loop_bound_callback(py, core, loop_obj, 1)?;
+        super::asyncio_cache::set_asyncgen_hooks_fn(py)?.call1(py, (firstiter, finalizer))?;
 
         {
             let mut state = core.state.lock().expect("poisoned loop state");
@@ -73,14 +61,9 @@ impl Drop for AsyncgenHooksGuard {
     )]
     fn drop(&mut self) {
         Python::attach(|py| {
-            let sys = match py.import("sys") {
-                Ok(sys) => sys,
-                Err(_) => return,
-            };
-            let kwargs = PyDict::new(py);
-            let _ = kwargs.set_item("firstiter", self.old_firstiter.bind(py));
-            let _ = kwargs.set_item("finalizer", self.old_finalizer.bind(py));
-            let _ = sys.call_method("set_asyncgen_hooks", (), Some(&kwargs));
+            if let Ok(set_hooks) = super::asyncio_cache::set_asyncgen_hooks_fn(py) {
+                let _ = set_hooks.call1(py, (&self.old_firstiter, &self.old_finalizer));
+            }
         });
     }
 }

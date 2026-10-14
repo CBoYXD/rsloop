@@ -13,7 +13,7 @@
 use pyo3::{
     exceptions::PyRuntimeError,
     prelude::*,
-    sync::critical_section::with_critical_section,
+    sync::{PyOnceLock, critical_section::with_critical_section},
     types::{PyByteArray, PyByteArrayMethods},
 };
 
@@ -125,13 +125,14 @@ impl StreamReaderFastPath {
                     return Ok(false);
                 }
 
-                reader
-                    .bind(py)
-                    .setattr("_transport", transport.clone_ref(py).into_any())?;
+                reader.bind(py).setattr(
+                    python_names::transport_attr(py),
+                    transport.clone_ref(py).into_any(),
+                )?;
                 if let Some(protocol) = protocol.as_ref() {
                     protocol
                         .bind(py)
-                        .setattr("_transport", transport.into_any())?;
+                        .setattr(python_names::transport_attr(py), transport.into_any())?;
                 }
                 Ok(true)
             }
@@ -157,7 +158,10 @@ impl StreamReaderFastPath {
 
                 let reader = reader.bind(py);
                 let buffer = buffer.bind(py).cast::<PyByteArray>()?;
-                if reader.getattr("_eof")?.extract::<bool>()? {
+                if reader
+                    .getattr(python_names::eof_attr(py))?
+                    .extract::<bool>()?
+                {
                     return Err(PyRuntimeError::new_err("feed_data after feed_eof"));
                 }
 
@@ -185,26 +189,31 @@ impl StreamReaderFastPath {
                     Ok(end)
                 })?;
 
-                let waiter = reader.getattr("_waiter")?;
+                let waiter = reader.getattr(python_names::waiter_attr(py))?;
                 if !waiter.is_none() {
-                    reader.setattr("_waiter", py.None())?;
-                    if !waiter.call_method0("cancelled")?.extract::<bool>()? {
-                        waiter.call_method1("set_result", (py.None(),))?;
+                    reader.setattr(python_names::waiter_attr(py), py.None())?;
+                    if !waiter
+                        .call_method0(python_names::cancelled(py))?
+                        .extract::<bool>()?
+                    {
+                        waiter.call_method1(python_names::set_result(py), (py.None(),))?;
                     }
                 }
 
-                let transport = reader.getattr("_transport")?;
-                let paused = reader.getattr("_paused")?.extract::<bool>()?;
+                let transport = reader.getattr(python_names::transport_attr(py))?;
+                let paused = reader
+                    .getattr(python_names::paused_attr(py))?
+                    .extract::<bool>()?;
                 if !transport.is_none() && !paused && end > 2 * limit {
                     match transport.call_method0(python_names::pause_reading(py)) {
                         Ok(_) => {
-                            reader.setattr("_paused", true)?;
+                            reader.setattr(python_names::paused_attr(py), true)?;
                         }
                         Err(err)
                             if err
                                 .is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py) =>
                         {
-                            reader.setattr("_transport", py.None())?;
+                            reader.setattr(python_names::transport_attr(py), py.None())?;
                         }
                         Err(err) => return Err(err),
                     }
@@ -246,12 +255,15 @@ impl StreamReaderFastPath {
             Self::Native { reader, .. } => reader.borrow_mut(py).feed_eof_internal(py),
             Self::Generic { reader, .. } => {
                 let reader = reader.bind(py);
-                reader.setattr("_eof", true)?;
-                let waiter = reader.getattr("_waiter")?;
+                reader.setattr(python_names::eof_attr(py), true)?;
+                let waiter = reader.getattr(python_names::waiter_attr(py))?;
                 if !waiter.is_none() {
-                    reader.setattr("_waiter", py.None())?;
-                    if !waiter.call_method0("cancelled")?.extract::<bool>()? {
-                        waiter.call_method1("set_result", (py.None(),))?;
+                    reader.setattr(python_names::waiter_attr(py), py.None())?;
+                    if !waiter
+                        .call_method0(python_names::cancelled(py))?
+                        .extract::<bool>()?
+                    {
+                        waiter.call_method1(python_names::set_result(py), (py.None(),))?;
                     }
                 }
                 Ok(())
@@ -285,22 +297,42 @@ impl StreamReaderFastPath {
                         reader
                             .bind(py)
                             .setattr("_exception", err_value.clone_ref(py))?;
-                        let waiter = reader.bind(py).getattr("_waiter")?;
+                        let waiter = reader.bind(py).getattr(python_names::waiter_attr(py))?;
                         if !waiter.is_none() {
-                            reader.bind(py).setattr("_waiter", py.None())?;
-                            if !waiter.call_method0("cancelled")?.extract::<bool>()? {
-                                waiter.call_method1("set_exception", (err_value.clone_ref(py),))?;
+                            reader
+                                .bind(py)
+                                .setattr(python_names::waiter_attr(py), py.None())?;
+                            if !waiter
+                                .call_method0(python_names::cancelled(py))?
+                                .extract::<bool>()?
+                            {
+                                waiter.call_method1(
+                                    python_names::set_exception(py),
+                                    (err_value.clone_ref(py),),
+                                )?;
                             }
                         }
                         let closed = protocol.getattr("_closed")?;
-                        if !closed.call_method0("done")?.extract::<bool>()? {
-                            closed.call_method1("set_exception", (err_value.clone_ref(py),))?;
+                        if !closed
+                            .call_method0(python_names::done(py))?
+                            .extract::<bool>()?
+                        {
+                            closed.call_method1(
+                                python_names::set_exception(py),
+                                (err_value.clone_ref(py),),
+                            )?;
                         }
-                        if protocol.getattr("_paused")?.extract::<bool>()? {
+                        if protocol
+                            .getattr(python_names::paused_attr(py))?
+                            .extract::<bool>()?
+                        {
                             let waiters = protocol.getattr("_drain_waiters")?;
                             for waiter in waiters.try_iter()? {
                                 let waiter = waiter?;
-                                if !waiter.call_method0("done")?.extract::<bool>()? {
+                                if !waiter
+                                    .call_method0(python_names::done(py))?
+                                    .extract::<bool>()?
+                                {
                                     waiter.call_method1(
                                         "set_exception",
                                         (err_value.clone_ref(py),),
@@ -312,22 +344,32 @@ impl StreamReaderFastPath {
                     None => {
                         self.feed_eof(py)?;
                         let closed = protocol.getattr("_closed")?;
-                        if !closed.call_method0("done")?.extract::<bool>()? {
-                            closed.call_method1("set_result", (py.None(),))?;
+                        if !closed
+                            .call_method0(python_names::done(py))?
+                            .extract::<bool>()?
+                        {
+                            closed.call_method1(python_names::set_result(py), (py.None(),))?;
                         }
-                        if protocol.getattr("_paused")?.extract::<bool>()? {
+                        if protocol
+                            .getattr(python_names::paused_attr(py))?
+                            .extract::<bool>()?
+                        {
                             let waiters = protocol.getattr("_drain_waiters")?;
                             for waiter in waiters.try_iter()? {
                                 let waiter = waiter?;
-                                if !waiter.call_method0("done")?.extract::<bool>()? {
-                                    waiter.call_method1("set_result", (py.None(),))?;
+                                if !waiter
+                                    .call_method0(python_names::done(py))?
+                                    .extract::<bool>()?
+                                {
+                                    waiter
+                                        .call_method1(python_names::set_result(py), (py.None(),))?;
                                 }
                             }
                         }
                     }
                 }
 
-                protocol.setattr("_transport", py.None())?;
+                protocol.setattr(python_names::transport_attr(py), py.None())?;
                 protocol.setattr("_task", py.None())?;
                 Ok(())
             }
@@ -450,9 +492,17 @@ pub(super) fn asyncio_stream_reader_fast_path(
     py: Python<'_>,
     protocol: &Bound<'_, PyAny>,
 ) -> PyResult<Option<StreamReaderFastPath>> {
-    let asyncio_streams = py.import("asyncio.streams")?;
-    let stream_reader_protocol_cls = asyncio_streams.getattr("StreamReaderProtocol")?;
-    if !protocol.is_instance(&stream_reader_protocol_cls)? {
+    static PROTOCOL: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let stream_reader_protocol_cls = PROTOCOL
+        .get_or_try_init(py, || {
+            Ok::<_, PyErr>(
+                py.import("asyncio.streams")?
+                    .getattr("StreamReaderProtocol")?
+                    .unbind(),
+            )
+        })?
+        .bind(py);
+    if !protocol.is_instance(stream_reader_protocol_cls)? {
         return Ok(None);
     }
 

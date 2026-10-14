@@ -30,7 +30,7 @@ pub enum ReadyItem {
     StreamTransportRead(Arc<StreamTransportCore>),
     StreamTransportWrite(Arc<StreamTransportCore>),
     #[cfg(unix)]
-    StartTcpReader(Box<TcpReaderStart>),
+    StartSocketReader(Box<SocketReaderStart>),
     ProcessTransport(Arc<ProcessTransportCore>),
     ServerAccepted(Box<AcceptedConnection>),
     StartServerAccept(Box<ServerAcceptStart>),
@@ -70,10 +70,10 @@ pub struct ConnectCompletion {
 // Reader startup is infrequent compared with callback dispatch. Keep its
 // three-word payload out of line so it does not enlarge every ready-queue slot.
 #[cfg(unix)]
-pub struct TcpReaderStart {
+pub struct SocketReaderStart {
     pub fd: RawFd,
     pub core: Arc<StreamTransportCore>,
-    pub stream: Arc<std::net::TcpStream>,
+    pub reader: ReaderTarget,
 }
 
 pub struct ServerAcceptStart {

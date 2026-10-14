@@ -1,6 +1,6 @@
 //! One cached allocation for successive scheduler batches on an owner thread.
 
-#[cfg(all(feature = "scheduler-batch-cache", not(kani)))]
+#[cfg(not(kani))]
 mod native {
     use std::{
         alloc::{AllocError, Allocator, Layout, System},
@@ -59,8 +59,12 @@ mod native {
         )]
         #[inline]
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-            if layout.size() != 0 && layout.size() <= MAX_RETAINED && self.cached.get().is_none() {
-                self.cached.set(Some(Block { ptr, layout }));
+            if layout.size() != 0 && layout.size() <= MAX_RETAINED {
+                if let Some(previous) = self.cached.replace(Some(Block { ptr, layout })) {
+                    // SAFETY: the previous slot contains a returned System
+                    // allocation, disjoint from this newly returned block.
+                    unsafe { System.deallocate(previous.ptr, previous.layout) };
+                }
             } else {
                 // SAFETY: the caller supplies a live System-backed block with
                 // its exact layout; zero-sized blocks also delegate to System.
@@ -293,12 +297,12 @@ mod native {
     }
 }
 
-#[cfg(all(feature = "scheduler-batch-cache", not(kani)))]
+#[cfg(not(kani))]
 pub(crate) use draining::drain_batch;
-#[cfg(all(feature = "scheduler-batch-cache", not(kani)))]
+#[cfg(not(kani))]
 pub(crate) use native::{Batch, BatchAllocator, batch};
 
-#[cfg(all(feature = "scheduler-batch-cache", not(kani)))]
+#[cfg(not(kani))]
 mod draining {
     use super::Batch;
 
@@ -366,9 +370,9 @@ mod draining {
     }
 }
 
-// Default builds preserve the original allocation/drain path. Kani's compiler
-// also predates stabilization, so its scheduler proofs use this implementation.
-#[cfg(any(kani, not(feature = "scheduler-batch-cache")))]
+// Kani's compiler predates allocator stabilization; its scheduler proofs
+// use ordinary vectors while native builds reuse returned batch storage.
+#[cfg(kani)]
 mod ordinary {
     #[derive(Default)]
     pub(crate) struct BatchAllocator {}
@@ -385,5 +389,5 @@ mod ordinary {
     }
 }
 
-#[cfg(any(kani, not(feature = "scheduler-batch-cache")))]
+#[cfg(kani)]
 pub(crate) use ordinary::{Batch, BatchAllocator, batch, drain_batch};

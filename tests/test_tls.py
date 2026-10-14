@@ -217,6 +217,35 @@ class TestTls:
 
         assert rsloop.run(main()) == (True, True)
 
+    def test_server_config_cache_reuses_and_invalidates(self) -> None:
+        async def main() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                _, cert_path, key_path = make_cert_files(tmpdir)
+                server_ctx, _ = make_ssl_contexts(tmpdir)
+
+                async def create_once() -> object:
+                    server = await asyncio.start_server(
+                        lambda reader, writer: writer.close(),
+                        "127.0.0.1",
+                        0,
+                        ssl=server_ctx,
+                    )
+                    try:
+                        return server_ctx.__dict__["_rsloop_server_config_cache"]
+                    finally:
+                        server.close()
+                        await server.wait_closed()
+
+                first = await create_once()
+                assert await create_once() is first
+                server_ctx.load_cert_chain(cert_path, key_path)
+                reloaded = await create_once()
+                assert reloaded is not first
+                server_ctx.verify_mode = ssl.CERT_OPTIONAL
+                assert await create_once() is not reloaded
+
+        rsloop.run(main())
+
     def test_server_close_cancels_pending_tls_handshake(self) -> None:
         async def main() -> None:
             async def handle(

@@ -45,6 +45,21 @@ impl DefaultBlockingThreadPool {
     }
 }
 
+// rusty_pool's Task conversion can accept an existing boxed closure directly.
+// Wrapping it in another closure would allocate a second Job box.
+struct PooledJob(Box<dyn FnOnce() + Send + 'static>);
+impl rusty_pool::Task<()> for PooledJob {
+    fn run(self) {
+        (self.0)();
+    }
+    fn into_fn(self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+        Some(self.0)
+    }
+    fn is_fn(&self) -> bool {
+        true
+    }
+}
+
 impl BlockingThreadPool for DefaultBlockingThreadPool {
     #[cfg_attr(
         feature = "profile",
@@ -52,9 +67,7 @@ impl BlockingThreadPool for DefaultBlockingThreadPool {
     )]
     #[inline]
     fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
-        self.inner.execute(move || {
-            task();
-        });
+        self.inner.execute(PooledJob(task));
     }
 }
 

@@ -29,9 +29,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
-#[cfg(all(unix, feature = "pipe"))]
-use std::io::{IoSlice, IoSliceMut};
-
 /// Trait for read-only buffers.
 ///
 /// This trait is implemented by types that can be used as buffers for
@@ -596,96 +593,6 @@ unsafe impl IoVectoredBufMut for Vec<Box<[u8]>> {
                 len: buf.len(),
             })
             .collect()
-    }
-}
-
-/// A temporary vectored buffer for polling operations.
-#[cfg(all(unix, feature = "pipe"))]
-pub(crate) struct IoVectoredBufTemporaryPoll {
-    iovecs: Vec<(*mut u8, usize)>,
-}
-
-#[cfg(all(unix, feature = "pipe"))]
-impl IoVectoredBufTemporaryPoll {
-    /// Create a new `IoVectoredBufTemporaryPoll` from immutable slices.
-    ///
-    /// # Safety
-    ///
-    /// All backing borrows must outlive this wrapper and any use of its
-    /// pointers. Use only for synchronous write polling, never completion
-    /// submission or mutable I/O. No pointer may be retained after the poll
-    /// returns.
-    #[cfg_attr(
-        feature = "profile",
-        hotpath::measure(impl_type = "IoVectoredBufTemporaryPoll")
-    )]
-    #[inline]
-    pub(crate) unsafe fn new(iovecs: &[IoSlice<'_>]) -> Self {
-        let iovecs = iovecs
-            .iter()
-            .map(|iovec| (iovec.as_ptr() as *mut u8, iovec.len()))
-            .collect();
-        Self { iovecs }
-    }
-
-    /// Create a new `IoVectoredBufTemporaryPoll` from mutable slices.
-    ///
-    /// # Safety
-    ///
-    /// All backing exclusive borrows must outlive this wrapper and any pointer
-    /// use. Use only for synchronous polling, never completion submission.
-    #[cfg_attr(
-        feature = "profile",
-        hotpath::measure(impl_type = "IoVectoredBufTemporaryPoll")
-    )]
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) unsafe fn new_mut(iovecs: &mut [IoSliceMut<'_>]) -> Self {
-        let iovecs = iovecs
-            .iter_mut()
-            .map(|iovec| (iovec.as_mut_ptr(), iovec.len()))
-            .collect();
-        Self { iovecs }
-    }
-}
-
-// SAFETY: the unsafe constructors require stable, initialized borrowed storage
-// and forbid retaining pointers beyond the synchronous polling operation.
-#[cfg(all(unix, feature = "pipe"))]
-unsafe impl IoVectoredBuf for IoVectoredBufTemporaryPoll {
-    #[cfg_attr(
-        feature = "profile",
-        hotpath::measure(impl_type = "<IoVectoredBufTemporaryPoll as IoVectoredBuf>")
-    )]
-    #[inline]
-    fn as_iovecs(&self) -> Box<[IoVec]> {
-        self.iovecs
-            .iter()
-            .map(|&(ptr, len)| IoVec { ptr, len })
-            .collect()
-    }
-
-    #[cfg_attr(
-        feature = "profile",
-        hotpath::measure(impl_type = "<IoVectoredBufTemporaryPoll as IoVectoredBuf>")
-    )]
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.iovecs.is_empty()
-    }
-}
-
-// SAFETY: mutable I/O is permitted only for new_mut, whose contract preserves
-// the non-overlapping exclusive IoSliceMut borrows throughout the poll.
-#[cfg(all(unix, feature = "pipe"))]
-unsafe impl IoVectoredBufMut for IoVectoredBufTemporaryPoll {
-    #[cfg_attr(
-        feature = "profile",
-        hotpath::measure(impl_type = "<IoVectoredBufTemporaryPoll as IoVectoredBufMut>")
-    )]
-    #[inline]
-    fn as_iovecs_mut(&mut self) -> Box<[IoVec]> {
-        self.as_iovecs()
     }
 }
 

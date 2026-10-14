@@ -293,3 +293,70 @@ This session built that revision in `target/report-v2-baseline-src` and selected
 its Python package with `PYTHONPATH`; the recorded native-module paths confirm
 the two measurements loaded different builds. Raw samples are saved locally
 in `target/report-v2-{before,after}-{loops,network,churn}.json`.
+
+## Completed performance-report implementation (October 14, 2026)
+
+Compared the release build at `2b9d618` with the completed report implementation
+on an Intel Core i9-9900K, Linux 7.0.0-38-generic, CPython 3.14.7 with the GIL,
+and the io_uring reactor. Both builds use the pinned Rust toolchain and lockfile.
+Processes and their worker threads are pinned to CPU 2. Each result is the
+median of seven measured runs after two warmups. Builds and correctness tests
+finished before the recorded benchmark pass.
+
+Times are milliseconds. The difference is after minus before; negative values
+mean less elapsed time.
+
+| Workload | Before (ms) | After (ms) | Difference (ms) |
+|---|---:|---:|---:|
+| 1,000,000 callbacks | 175.15 | 174.14 | -1.01 |
+| 200,000 tasks | 313.39 | 304.01 | -9.38 |
+| 20,000 TCP round trips | 363.81 | 361.53 | -2.28 |
+| 8,000 HTTP requests | 141.61 | 139.64 | -1.97 |
+| 8,000 TLS HTTP requests | 355.78 | 350.01 | -5.77 |
+| 8,000 WebSocket messages | 1586.40 | 1598.72 | +12.33 |
+| 8,000 TLS WebSocket messages | 1859.64 | 1857.35 | -2.29 |
+| 8,000 TCP connections | 862.70 | 819.90 | -42.80 |
+
+The largest measured reduction is connection churn: 42.80 ms (4.96%). Tasks
+improve by 9.38 ms (2.99%). Plain WebSocket messages take 12.33 ms longer (0.78%);
+this implementation does not produce a speedup in every workload. The small
+changes in the other workloads should be read alongside run-to-run variation.
+These timings measure whole workloads rather than individual function calls.
+
+The network matrix uses 16 concurrent connections with 500 requests/messages
+per connection, the default HTTP body and WebSocket frame sizes, and warm
+measurement mode. TCP round trips use 1,024-byte payloads. Connection churn
+checks one-byte echoes on 8,000 newly opened connections at concurrency 16.
+
+The [implementation audit](report-implementation.md) covers all 55 report
+recommendations, tests, ownership constraints and platform verification limits.
+The allocation budget checks pass; Python suites pass on 3.10, 3.14 and
+free-threaded 3.14, alongside the default and optional-feature Rust suites.
+
+### Reproduction
+
+Build `2b9d618` from an isolated archive with `maturin build --release --locked`,
+extract its wheel into a separate package directory, then run each command
+below twice. Set `PYTHONPATH` to the baseline package directory for the first
+pass and the candidate `python` directory for the second. Both passes use the
+same `.venv/bin/python` interpreter.
+
+```bash
+taskset -c 2 .venv/bin/python benches/compare_event_loops.py \
+  --loops rsloop --repeat 7 --warmups 2 --callbacks 1000000 \
+  --tasks 200000 --task-batch-size 5000 --tcp-roundtrips 20000 \
+  --payload-size 1024 --json-output target/report-full-<build>-loops.json
+
+taskset -c 2 .venv/bin/python benches/workload_matrix.py \
+  --loops rsloop --scenarios http_keepalive,tls_http,websocket_messages,websocket_tls \
+  --concurrency 16 --requests-per-connection 500 --repeat 7 --warmups 2 \
+  --json-output target/report-full-<build>-network.json
+
+taskset -c 2 .venv/bin/python benches/connection_churn.py \
+  --connections 8000 --concurrency 16 --repeat 7 --warmups 2 \
+  --output target/report-full-<build>-churn.json
+```
+
+Replace `<build>` with `before` or `after`. Local raw samples are in
+`target/report-full-{before,after}-{loops,network,churn}.json`; native binary
+paths and SHA-256 hashes are recorded in `target/report-full-benchmark-builds.json`.

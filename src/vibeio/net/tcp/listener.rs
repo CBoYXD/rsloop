@@ -77,6 +77,7 @@ pub struct TcpListener {
     // Deregister before closing the socket (field declaration order).
     handle: InnerRawHandle,
     inner: StdTcpListener,
+    ipv6: bool,
 }
 
 impl TcpListener {
@@ -99,6 +100,11 @@ impl TcpListener {
             let (socket, _) = poll_fn(move |cx| self.handle.poll_op(cx, &mut op)).await?;
             Ok(std::net::TcpStream::from(socket))
         }
+    }
+
+    /// Cached address family for accepted socket handoffs.
+    pub fn is_ipv6(&self) -> bool {
+        self.ipv6
     }
 
     /// Creates a new `TcpListener` which will be bound to the specified
@@ -146,7 +152,12 @@ impl TcpListener {
             Interest::READABLE,
         )?;
         inner.set_nonblocking(!handle.uses_completion())?;
-        Ok(Self { inner, handle })
+        let ipv6 = inner.local_addr()?.is_ipv6();
+        Ok(Self {
+            inner,
+            handle,
+            ipv6,
+        })
     }
 
     /// Creates a new `TcpListener` from a standard library `TcpListener` in
@@ -168,7 +179,12 @@ impl TcpListener {
             crate::vibeio::driver::RegistrationMode::Poll,
         )?;
         inner.set_nonblocking(!handle.uses_completion())?;
-        Ok(Self { inner, handle })
+        let ipv6 = inner.local_addr()?.is_ipv6();
+        Ok(Self {
+            inner,
+            handle,
+            ipv6,
+        })
     }
 
     /// Returns the local address of this listener.
@@ -225,7 +241,7 @@ impl IntoRawFd for TcpListener {
     )]
     #[inline]
     fn into_raw_fd(self) -> RawFd {
-        let Self { handle, inner } = self;
+        let Self { handle, inner, .. } = self;
         drop(handle);
         inner.into_raw_fd()
     }
@@ -251,7 +267,7 @@ impl IntoRawSocket for TcpListener {
     )]
     #[inline]
     fn into_raw_socket(self) -> RawSocket {
-        let Self { handle, inner } = self;
+        let Self { handle, inner, .. } = self;
         drop(handle);
         inner.into_raw_socket()
     }

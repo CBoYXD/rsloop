@@ -71,7 +71,7 @@ use buffers::{OwnedWriteBuffer, ReadBufferPool, WriteBufferPool};
 use builder::make_stream_extra;
 pub use builder::task_locals_for_loop;
 #[cfg(unix)]
-pub(crate) use connect::run_connect_watch_task;
+pub(crate) use connect::{connect_wait_state, run_connect_watch_task};
 pub use fast::{PyFastStreamReader, PyFastStreamWriter, open_connection, start_server};
 pub use io_targets::ReaderTarget;
 use io_targets::{LazyWriterConfig, TaskedDirectWriter};
@@ -149,6 +149,15 @@ struct StreamTransportState {
     server: Option<Weak<ServerCore>>,
 }
 
+impl crate::state_snapshot::SnapshotFlags for StreamTransportState {
+    fn snapshot_flags(&self) -> u8 {
+        u8::from(self.closing)
+            | (u8::from(self.writable) << 1)
+            | (u8::from(self.writer_registered) << 2)
+            | (u8::from(self.lost_called) << 3)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StreamWriteBufferState {
     size: usize,
@@ -177,7 +186,7 @@ impl Default for StreamWriteBufferState {
 pub struct StreamTransportCore {
     loop_core: Arc<LoopCore>,
     loop_obj: Py<PyAny>,
-    state: Mutex<StreamTransportState>,
+    state: crate::state_snapshot::SnapshotMutex<StreamTransportState>,
     pending_read_events: Mutex<VecDeque<PendingReadEvent>>,
     read_event_drain: Mutex<VecDeque<PendingReadEvent>>,
     read_coalesce_buffer: Mutex<Vec<u8>>,
@@ -209,6 +218,8 @@ pub struct StreamTransportCore {
     #[cfg(windows)]
     server_side: bool,
     coalesce_small_writes: bool,
+    small_write_turn: std::sync::atomic::AtomicU64,
+    small_writes_this_turn: AtomicU8,
 }
 
 struct ServerState {

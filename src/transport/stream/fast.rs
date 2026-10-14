@@ -171,7 +171,11 @@ impl ReadBuffer {
             return;
         }
         if self.start == self.bytes.len() {
-            if self.bytes.capacity() > self.max_retained_capacity {
+            if self.bytes.is_pooled() {
+                // Release the producer's slot as soon as it is consumed; an
+                // idle reader needs no allocation until new data arrives.
+                self.bytes = OwnedReadBuffer::with_capacity(0);
+            } else if self.bytes.capacity() > self.max_retained_capacity {
                 self.bytes = OwnedReadBuffer::with_capacity(self.baseline_capacity);
             } else {
                 self.bytes.clear();
@@ -1312,7 +1316,9 @@ impl PyFastStreamReader {
                 )?
                 .into_any(),
             };
-            reader.borrow_mut().waiter_done_cb = Some(callback.clone_ref(py));
+            if reader.borrow().waiter_done_cb.is_none() {
+                reader.borrow_mut().waiter_done_cb = Some(callback.clone_ref(py));
+            }
             future.call_method1(py, "add_done_callback", (callback,))?;
         }
         Ok(future)
@@ -2159,7 +2165,11 @@ impl PyFastStreamReader {
     #[pyo3(signature = (n=-1))]
     fn read(mut slf: PyRefMut<'_, Self>, py: Python<'_>, n: isize) -> PyResult<Py<PyAny>> {
         let future = slf.build_read_future(py, n)?;
-        Self::watch_waiter(slf, py, future)
+        if slf.waiter.is_some() {
+            Self::watch_waiter(slf, py, future)
+        } else {
+            Ok(future)
+        }
     }
 
     #[cfg_attr(
@@ -2184,7 +2194,11 @@ impl PyFastStreamReader {
             }
         };
         let future = slf.build_readexactly_future(py, n)?;
-        Self::watch_waiter(slf, py, future)
+        if slf.waiter.is_some() {
+            Self::watch_waiter(slf, py, future)
+        } else {
+            Ok(future)
+        }
     }
 
     #[cfg_attr(
@@ -2200,10 +2214,16 @@ impl PyFastStreamReader {
         hotpath::measure(impl_type = "PyFastStreamReader")
     )]
     fn __anext__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(py
-            .import("rsloop._stream_reader")?
-            .call_method1("next_line", (slf,))?
-            .unbind())
+        static NEXT_LINE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+        NEXT_LINE
+            .get_or_try_init(py, || {
+                Ok::<_, PyErr>(
+                    py.import("rsloop._stream_reader")?
+                        .getattr("next_line")?
+                        .unbind(),
+                )
+            })?
+            .call1(py, (slf,))
     }
 
     #[cfg_attr(
@@ -2227,7 +2247,11 @@ impl PyFastStreamReader {
             Err(err) => return slf.ready_exception_future(py, err.into_value(py).into_any()),
         };
         let future = slf.build_until_future(py, "readuntil", state)?;
-        Self::watch_waiter(slf, py, future)
+        if slf.waiter.is_some() {
+            Self::watch_waiter(slf, py, future)
+        } else {
+            Ok(future)
+        }
     }
 
     #[cfg_attr(
@@ -2237,7 +2261,11 @@ impl PyFastStreamReader {
     fn readline(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let state = UntilReadState::new(Separators::single(b"\n"), true)?;
         let future = slf.build_until_future(py, "readline", state)?;
-        Self::watch_waiter(slf, py, future)
+        if slf.waiter.is_some() {
+            Self::watch_waiter(slf, py, future)
+        } else {
+            Ok(future)
+        }
     }
 }
 
@@ -2252,6 +2280,7 @@ pub struct PyFastStreamProtocol {
     ready_none: Py<PyAny>,
     paused: bool,
     drain_waiters: Vec<Py<PyAny>>,
+    drain_waiter_done_cb: Option<Py<PyAny>>,
     connection_lost: bool,
     over_ssl: bool,
 }
@@ -2296,12 +2325,19 @@ impl PyFastStreamProtocol {
             .is_some_and(|waiter| waiter.bind(py).is(future.bind(py)))
         {
             let protocol = slf.into_pyobject(py)?;
-            let callback = Py::new(
-                py,
-                PyDrainWaiterDone {
-                    protocol: PyWeakrefReference::new(&protocol)?.unbind(),
-                },
-            )?;
+            let callback = match &protocol.borrow().drain_waiter_done_cb {
+                Some(callback) => callback.clone_ref(py),
+                None => Py::new(
+                    py,
+                    PyDrainWaiterDone {
+                        protocol: PyWeakrefReference::new(&protocol)?.unbind(),
+                    },
+                )?
+                .into_any(),
+            };
+            if protocol.borrow().drain_waiter_done_cb.is_none() {
+                protocol.borrow_mut().drain_waiter_done_cb = Some(callback.clone_ref(py));
+            }
             future.call_method1(py, "add_done_callback", (callback,))?;
         }
         Ok(future)
@@ -2335,6 +2371,7 @@ impl PyFastStreamProtocol {
             task: py.None(),
             paused: false,
             drain_waiters: Vec::new(),
+            drain_waiter_done_cb: None,
             connection_lost: false,
             over_ssl: false,
         })
@@ -2964,10 +3001,16 @@ impl PyFastProtocolFactory {
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
 fn running_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
-    Ok(py
-        .import("asyncio.events")?
-        .call_method0("get_running_loop")?
-        .unbind())
+    static GET_RUNNING_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    GET_RUNNING_LOOP
+        .get_or_try_init(py, || {
+            Ok::<_, PyErr>(
+                py.import("asyncio.events")?
+                    .getattr("get_running_loop")?
+                    .unbind(),
+            )
+        })?
+        .call0(py)
 }
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
@@ -3082,14 +3125,23 @@ pub fn open_connection(
     // the loop thread with data_received/connection_lost; a Send bridge runs
     // on smol workers and races those mutable borrows without the GIL.
     // Direct Python await also forwards cancellation to create_connection.
-    Ok(py
-        .import("rsloop._stream_connection")?
-        .getattr("open_connection")?
-        .call1((
-            awaitable,
-            wrap_pyfunction!(fast_open_connection_result, py)?,
-        ))?
-        .unbind())
+    static OPEN_CONNECTION: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    static RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let open = OPEN_CONNECTION.get_or_try_init(py, || {
+        Ok::<_, PyErr>(
+            py.import("rsloop._stream_connection")?
+                .getattr("open_connection")?
+                .unbind(),
+        )
+    })?;
+    let assemble = RESULT.get_or_try_init(py, || {
+        Ok::<_, PyErr>(
+            wrap_pyfunction!(fast_open_connection_result, py)?
+                .unbind()
+                .into_any(),
+        )
+    })?;
+    open.call1(py, (awaitable, assemble))
 }
 
 /// Returns an awaitable that starts a stream server.

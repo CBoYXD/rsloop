@@ -45,6 +45,7 @@ impl Interruptor for KqueueInterruptor {
 struct DriverWaker {
     sender: UnixDatagram,
     receiver: UnixDatagram,
+    notified: std::sync::atomic::AtomicBool,
 }
 
 impl DriverWaker {
@@ -53,25 +54,41 @@ impl DriverWaker {
         let (sender, receiver) = UnixDatagram::pair()?;
         sender.set_nonblocking(true)?;
         receiver.set_nonblocking(true)?;
-        Ok(Self { sender, receiver })
+        Ok(Self {
+            sender,
+            receiver,
+            notified: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "DriverWaker"))]
     #[inline]
     fn wake(&self) -> io::Result<()> {
-        super::send_wake_notification(|| self.sender.send(&[1]))
+        use std::sync::atomic::Ordering;
+        if self.notified.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = super::send_wake_notification(|| self.sender.send(&[1]));
+        if result.is_err() {
+            self.notified.store(false, Ordering::Release);
+        }
+        result
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "DriverWaker"))]
     fn acknowledge(&self) {
-        let mut buffer = [0_u8; 256];
+        // Keep the flag set until the single pending datagram is consumed.
+        // Clearing it before recv would permit a second datagram and break
+        // the one-recv invariant on an edge-triggered selector.
+        let mut byte = [0_u8; 1];
         loop {
-            match self.receiver.recv(&mut buffer) {
-                Ok(_) => {}
+            match self.receiver.recv(&mut byte) {
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => return,
+                _ => break,
             }
         }
+        self.notified
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -514,25 +531,28 @@ impl Driver for KqueueDriver {
             (token, generation)
         };
         let key = Self::encode_key(token, generation);
-        let mut changes = Vec::with_capacity(2);
+        let mut changes = [Self::change(0, 0, 0, 0); 2];
+        let mut len = 0;
         if interest.is_readable() {
-            changes.push(Self::change(
+            changes[len] = Self::change(
                 handle.handle,
                 libc::EVFILT_READ,
                 libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
                 key,
-            ));
+            );
+            len += 1;
         }
         if interest.is_writable() {
-            changes.push(Self::change(
+            changes[len] = Self::change(
                 handle.handle,
                 libc::EVFILT_WRITE,
                 libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
                 key,
-            ));
+            );
+            len += 1;
         }
         if let Err(err) =
-            self.install_registration_with(&changes, |changes| self.apply_changes(changes))
+            self.install_registration_with(&changes[..len], |changes| self.apply_changes(changes))
         {
             let _ = self.state.borrow_mut().registrations.try_remove(token.0);
             return Err(err);
@@ -630,6 +650,23 @@ impl Driver for KqueueDriver {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_wakes_coalesce_and_acknowledgement_allows_next_notification() {
+        let waker = super::DriverWaker::new().unwrap();
+        for _ in 0..100 {
+            waker.wake().unwrap();
+        }
+        waker.acknowledge();
+        let mut byte = [0];
+        assert_eq!(
+            waker.receiver.recv(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        waker.wake().unwrap();
+        assert_eq!(waker.receiver.recv(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [1]);
+    }
+
     #[test]
     fn readiness_for_unregistered_filters_does_not_change_state() {
         for read_registered in [false, true] {

@@ -242,6 +242,17 @@ impl UringDriver {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_unclaimed_readiness(&self, token: Token) -> bool {
+        if let Some(HandleRegistration::Poll(registration)) =
+            self.state.borrow_mut().registrations.get_mut(token.0)
+        {
+            registration.read_closed || std::mem::take(&mut registration.unclaimed_readiness)
+        } else {
+            false
+        }
+    }
+
     /// Stop all submitted work before retained operation storage is released.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "UringDriver"))]
     fn quiesce(&mut self) -> io::Result<()> {
@@ -499,7 +510,10 @@ impl UringDriver {
                 sq.cq_overflow() || sq.taskrun()
             };
             let ready = !ring.completion().is_empty();
-            let wait_for_one = wait_for_one && !idle_poll && (!ready || kernel_work);
+            let wait_for_one = wait_for_one
+                && !idle_poll
+                && (!ready || kernel_work)
+                && (timeout != Some(Duration::ZERO) || kernel_work);
             let should_submit = if wait_for_one || kernel_work {
                 true
             } else {
@@ -1018,20 +1032,45 @@ impl Driver for UringDriver {
     )]
     #[inline]
     fn deregister_handle(&self, handle: &InnerRawHandle) -> Result<(), io::Error> {
-        {
-            // Cancel any pending io_uring operations for this handle
-            let ring = self.ring.borrow_mut();
+        let (registration, needs_cancel) = {
+            let mut state = self.state.borrow_mut();
+            let registration = state.registrations.try_remove(handle.token.0);
+            let needs_cancel = match &registration {
+                Some(HandleRegistration::Poll(poll)) => poll.poll_armed,
+                Some(HandleRegistration::Completion(completion)) => {
+                    completion
+                        .accept
+                        .as_ref()
+                        .is_some_and(|accept| accept.armed)
+                        || state
+                            .completions
+                            .iter()
+                            .any(|(_, completion)| completion.completed.is_none())
+                }
+                None => false,
+            };
+            (registration, needs_cancel)
+        };
+        if needs_cancel {
+            let mut ring = self.ring.borrow_mut();
+            // Cancellation must include SQEs that have been queued but not
+            // submitted yet, while this handle still owns its open descriptor.
+            if !ring.submission().is_empty() {
+                Self::submitter_call_result(ring.submit())?;
+            }
             let _ = ring.submitter().register_sync_cancel(
                 Some(Timespec::new().nsec(0).sec(0)),
-                types::CancelBuilder::fd(types::Fd(handle.handle)),
+                match &registration {
+                    // Match the registration's unique request key rather than
+                    // the fd number. Python may close a borrowed connect fd
+                    // and reuse that number before cancellation is processed.
+                    Some(HandleRegistration::Poll(poll)) => types::CancelBuilder::user_data(
+                        Self::encode_poll_key(handle.token, poll.generation),
+                    ),
+                    _ => types::CancelBuilder::fd(types::Fd(handle.handle)),
+                },
             );
         }
-
-        let registration = self
-            .state
-            .borrow_mut()
-            .registrations
-            .try_remove(handle.token.0);
         if registration.is_none() {
             return Err(io::Error::new(
                 ErrorKind::NotFound,

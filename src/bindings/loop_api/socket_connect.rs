@@ -242,10 +242,13 @@ pub(super) fn fast_sock_connect<'py>(
     // (loop thread), so the completion is delivered without a cross-thread
     // wake.
     let core = slf.borrow(py).core.clone();
+    let wake = crate::transport::stream::connect_wait_state(py, &future, Some(sock.clone_ref(py)))?;
     if !core.spawn_io(crate::transport::stream::run_connect_watch_task(
         Arc::clone(&core),
         fd,
         future.clone_ref(py),
+        Some(wake),
+        Some(sock),
     )) {
         return Err(PyRuntimeError::new_err(
             "event loop is not running; cannot start connect watch",

@@ -1,10 +1,6 @@
 //! Starting, stopping, and closing the loop.
 
-use pyo3::{
-    exceptions::PyRuntimeError,
-    prelude::*,
-    types::{PyDict, PyModule},
-};
+use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use super::{PyLoop, asyncgens::AsyncgenHooksGuard};
 use crate::engine::LoopCoreError;
@@ -50,25 +46,13 @@ pub(super) fn run_until_complete(
     let core = slf.borrow(py).core.clone();
     let loop_obj = PyLoop::as_py_any(py, &slf);
     let _asyncgen_hooks = AsyncgenHooksGuard::install(py, &loop_obj, &core)?;
-    let asyncio = py.import("asyncio")?;
-    let new_task = !asyncio
-        .getattr("isfuture")?
-        .call1((future.clone_ref(py),))?
-        .extract::<bool>()?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("loop", loop_obj.clone_ref(py))?;
-    let wrapped = asyncio
-        .getattr("ensure_future")?
-        .call((future,), Some(&kwargs))?;
+    let new_task = !super::asyncio_cache::isfuture_fn(py)?
+        .call1(py, (&future,))?
+        .extract::<bool>(py)?;
+    let wrapped = super::asyncio_cache::ensure_future(py, &future, &loop_obj)?;
+    let stopper = super::asyncio_cache::loop_bound_callback(py, &core, &loop_obj, 2)?;
 
-    let helper_mod = PyModule::import(py, "rsloop._loop")?;
-    let functools = py.import("functools")?;
-    let stopper = functools.getattr("partial")?.call1((
-        helper_mod.getattr("future_done_stop")?,
-        loop_obj.clone_ref(py),
-    ))?;
-
-    wrapped.call_method1("add_done_callback", (stopper.clone(),))?;
+    wrapped.call_method1("add_done_callback", (stopper.clone_ref(py),))?;
     let result =
         super::fast_callbacks::with_attached_callbacks(py, || core.run_forever(py, loop_obj));
     let _ = wrapped.call_method1("remove_done_callback", (stopper,));

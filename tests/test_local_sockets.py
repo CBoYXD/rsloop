@@ -237,3 +237,69 @@ class TestLocalSocket:
         with pytest.raises(OSError):
             self.run_async(self.loop.sock_recv(a, 1))
         assert b.fileno() >= 0
+
+
+def test_socket_sendall_reuses_waits_across_repeated_backpressure():
+    class PartialSender(socket.socket):
+        attempts = 0
+        blocked = 0
+
+        def send(self, data, flags=0):
+            self.attempts += 1
+            try:
+                return super().send(data[:1024], flags)
+            except BlockingIOError:
+                self.blocked += 1
+                raise
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        sender, receiver = socket.socketpair()
+        wrapped = PartialSender(fileno=sender.detach())
+        wrapped.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        wrapped.setblocking(False)
+        receiver.setblocking(False)
+        payload = bytes(range(256)) * 32768
+
+        async def receive_all():
+            received = bytearray()
+            while len(received) < len(payload):
+                received.extend(await loop.sock_recv(receiver, 65536))
+            return received
+
+        receiving = asyncio.create_task(receive_all())
+        try:
+            await asyncio.wait_for(loop.sock_sendall(wrapped, payload), 5)
+            assert await asyncio.wait_for(receiving, 5) == payload
+            assert wrapped.attempts >= len(payload) // 1024
+            assert wrapped.blocked >= 2
+        finally:
+            receiving.cancel()
+            await asyncio.gather(receiving, return_exceptions=True)
+            wrapped.close()
+            receiver.close()
+
+    rsloop.run(main())
+
+
+def test_loop_close_releases_socket_wait_cancelled_before_native_poll():
+    import gc
+    import weakref
+
+    sender, receiver = socket.socketpair()
+    receiver.setblocking(False)
+    loop = rsloop.new_event_loop()
+    reference = weakref.ref(receiver)
+    try:
+        future = loop.sock_recv(receiver, 1)
+        # Start the service, then end the run before it needs a readiness event.
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+        future.cancel()
+        loop.close()
+        del receiver
+        gc.collect()
+        assert reference() is None
+    finally:
+        loop.close()
+        sender.close()

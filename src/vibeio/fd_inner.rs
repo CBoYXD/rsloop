@@ -86,6 +86,15 @@ impl InnerRawHandle {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_unclaimed_readiness(&self) -> bool {
+        match self.driver.as_ref() {
+            AnyDriver::Mio(driver) => driver.take_unclaimed_readiness(self.token),
+            AnyDriver::IoUring(driver) => driver.take_unclaimed_readiness(self.token),
+            AnyDriver::Mock(_) => false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_mock_completion(driver: Rc<AnyDriver>) -> Self {
         assert!(matches!(driver.as_ref(), AnyDriver::Mock(_)));

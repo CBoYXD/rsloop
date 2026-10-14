@@ -153,9 +153,10 @@ pub async fn canonicalize<P: AsRef<std::path::Path>>(path: P) -> std::io::Result
 pub async fn read(path: impl AsRef<std::path::Path>) -> std::io::Result<Vec<u8>> {
     let mut file: File = OpenOptions::new().read(true).open(path).await?;
     let mut bytes = Vec::new();
-    let mut buf = [0u8; 8192];
+    let mut buf = Vec::with_capacity(8192);
 
     loop {
+        buf.clear();
         let (read, returned_buf) = file.read(buf).await;
         let read = read?;
         buf = returned_buf;
@@ -191,6 +192,43 @@ pub async fn read_to_string(path: impl AsRef<std::path::Path>) -> std::io::Resul
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.utf8_error()))
 }
 
+/// Convert a write input to stable owned storage. Owned vectors and strings
+/// move their allocation; borrowed AsRef inputs copy once for cancellation
+/// safety.
+pub trait IntoFileBytes {
+    fn into_file_bytes(self) -> Vec<u8>;
+}
+impl IntoFileBytes for Vec<u8> {
+    fn into_file_bytes(self) -> Vec<u8> {
+        self
+    }
+}
+impl IntoFileBytes for String {
+    fn into_file_bytes(self) -> Vec<u8> {
+        self.into_bytes()
+    }
+}
+impl IntoFileBytes for Box<[u8]> {
+    fn into_file_bytes(self) -> Vec<u8> {
+        self.into_vec()
+    }
+}
+impl<T: AsRef<[u8]> + ?Sized> IntoFileBytes for &T {
+    fn into_file_bytes(self) -> Vec<u8> {
+        self.as_ref().to_vec()
+    }
+}
+impl<const N: usize> IntoFileBytes for [u8; N] {
+    fn into_file_bytes(self) -> Vec<u8> {
+        Vec::from(self)
+    }
+}
+impl<'a> IntoFileBytes for std::borrow::Cow<'a, [u8]> {
+    fn into_file_bytes(self) -> Vec<u8> {
+        self.into_owned()
+    }
+}
+
 /// Writes a byte slice to a file, creating it if necessary.
 ///
 /// This is the async version of [`std::fs::write`].
@@ -205,10 +243,13 @@ pub async fn read_to_string(path: impl AsRef<std::path::Path>) -> std::io::Resul
 /// This function will return an error in the following situations:
 /// - The file cannot be opened for writing
 /// - The write operation fails
+///
+/// Owned vectors, strings and boxed slices move their allocation into the
+/// operation. Borrowed inputs copy once to remain valid after cancellation.
 #[cfg_attr(feature = "profile", hotpath::measure(future = true))]
 pub async fn write(
     path: impl AsRef<std::path::Path>,
-    contents: impl AsRef<[u8]>,
+    contents: impl IntoFileBytes,
 ) -> std::io::Result<()> {
     let mut file: File = OpenOptions::new()
         .write(true)
@@ -220,7 +261,7 @@ pub async fn write(
     // The newly truncated file starts at offset zero. Retain one owned buffer
     // across partial writes and interruption retries instead of recopying its
     // remaining suffix for every attempt.
-    file.write_exact_at(contents.as_ref().to_vec(), 0).await.0?;
+    file.write_exact_at(contents.into_file_bytes(), 0).await.0?;
     file.flush().await
 }
 
@@ -1625,5 +1666,30 @@ mod tests {
 
             let _ = std::fs::remove_file(path);
         });
+    }
+}
+
+#[cfg(test)]
+mod owned_write_input_tests {
+    use super::IntoFileBytes;
+
+    #[test]
+    fn owned_inputs_move_storage_and_borrowed_inputs_remain_independent() {
+        let bytes = vec![3; 1024];
+        let address = bytes.as_ptr();
+        let returned = bytes.into_file_bytes();
+        assert_eq!(returned.as_ptr(), address);
+        let text = String::from("write without copying");
+        let address = text.as_ptr();
+        let returned = text.into_file_bytes();
+        assert_eq!(returned.as_ptr(), address);
+        let bytes = vec![4; 1024].into_boxed_slice();
+        let address = bytes.as_ptr();
+        let returned = bytes.into_file_bytes();
+        assert_eq!(returned.as_ptr(), address);
+        let mut source = vec![5; 1024];
+        let copy = (&source).into_file_bytes();
+        source.fill(9);
+        assert_eq!(copy, [5; 1024]);
     }
 }

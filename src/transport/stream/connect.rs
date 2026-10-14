@@ -1,59 +1,130 @@
-//! Completing a non-blocking `connect()` on the loop runtime.
-
+//! Completing nonblocking connects without taking ownership of Python's fd.
 use std::{
-    io,
-    net::TcpStream as StdTcpStream,
-    os::{fd::FromRawFd, raw::c_int},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
 };
 
-use pyo3::prelude::*;
+use futures::task::AtomicWaker;
+use pyo3::{PyTraverseError, PyVisit, prelude::*};
 
 use crate::{
     engine::{LoopCommand, LoopCore},
     fd_ops,
-    vibeio::net::PollTcpStream as VibePollTcpStream,
+    vibeio::{InnerRawHandle, ReadinessOp, RegistrationMode},
 };
 
-/// Waits for a connecting TCP socket to become writable on the vibeio reactor,
-/// then hands the outcome back to the loop thread via `ConnectCompleted`. The
-/// descriptor is duplicated so the vibeio stream owns (and closes) only the
-/// dup; the connecting socket stays owned by its Python object. The dup shares
-/// the same underlying socket, so its POLLOUT readiness reflects the connect
-/// completing.
+#[derive(Default)]
+pub(crate) struct ConnectWake {
+    done: AtomicBool,
+    waker: AtomicWaker,
+}
+
+#[pyclass]
+struct ConnectDone {
+    wake: Arc<ConnectWake>,
+    socket: Option<Py<PyAny>>,
+}
+#[pymethods]
+impl ConnectDone {
+    fn __call__(&self, _future: &Bound<'_, PyAny>) {
+        self.wake.done.store(true, Ordering::Release);
+        self.wake.waker.wake();
+    }
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(socket) = &self.socket {
+            visit.call(socket)?;
+        }
+        Ok(())
+    }
+    fn __clear__(&mut self) {
+        self.socket = None;
+        self.wake.done.store(true, Ordering::Release);
+        self.wake.waker.wake();
+    }
+}
+
+/// Keep the original socket alive and wake the native wait on cancellation.
+pub(crate) fn connect_wait_state(
+    py: Python<'_>,
+    future: &Py<PyAny>,
+    socket: Option<Py<PyAny>>,
+) -> PyResult<Arc<ConnectWake>> {
+    let wake = Arc::new(ConnectWake::default());
+    future.call_method1(
+        py,
+        crate::python_names::add_done_callback(py),
+        (Py::new(
+            py,
+            ConnectDone {
+                wake: wake.clone(),
+                socket,
+            },
+        )?,),
+    )?;
+    Ok(wake)
+}
+
 #[cfg_attr(feature = "profile", hotpath::measure(future = true))]
 pub(crate) async fn run_connect_watch_task(
     core: Arc<LoopCore>,
     fd: fd_ops::RawFd,
     future: Py<PyAny>,
+    wake: Option<Arc<ConnectWake>>,
+    socket_keepalive: Option<Py<PyAny>>,
 ) {
-    use crate::vibeio::io::AsyncWritePoll;
-
+    let wake = match wake {
+        Some(wake) => wake,
+        None => match Python::attach(|py| connect_wait_state(py, &future, None)) {
+            Ok(wake) => wake,
+            Err(_) => return,
+        },
+    };
     let wait_errno = 'wait: {
-        let Ok(raw) = c_int::try_from(fd) else {
+        let Ok(raw) = i32::try_from(fd) else {
             break 'wait libc::EBADF;
         };
-        // SAFETY: `raw` is a live socket descriptor owned by the Python socket.
-        let dup = unsafe { libc::dup(raw) };
-        if dup < 0 {
-            break 'wait io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EBADF);
-        }
-        // SAFETY: `dup` is a freshly duplicated, owned socket descriptor.
-        let std_stream = unsafe { StdTcpStream::from_raw_fd(dup) };
-        match VibePollTcpStream::from_std(std_stream) {
-            Ok(stream) => match stream.writable().await {
-                Ok(()) => 0,
-                Err(err) => err.raw_os_error().unwrap_or(0),
-            },
-            Err(err) => err.raw_os_error().unwrap_or(libc::EBADF),
+        let handle = match InnerRawHandle::new_with_mode(
+            raw,
+            mio::Interest::WRITABLE,
+            RegistrationMode::Poll,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => break 'wait error.raw_os_error().unwrap_or(libc::EBADF),
+        };
+        let mut armed = false;
+        let result = std::future::poll_fn(|cx| {
+            wake.waker.register(cx.waker());
+            if wake.done.load(Ordering::Acquire) {
+                return Poll::Ready(Ok(false));
+            }
+            if armed {
+                return Poll::Ready(Ok(true));
+            }
+            armed = true;
+            handle
+                .poll_op_poll(cx, &mut ReadinessOp::new_writable(&handle))
+                .map(|result| result.map(|()| true))
+        })
+        .await;
+        match result {
+            Ok(false) => return,
+            Ok(true) => 0,
+            Err(error) => error.raw_os_error().unwrap_or(libc::EBADF),
         }
     };
-
-    let _ = core.send_command(LoopCommand::ConnectCompleted {
-        future,
-        fd,
-        wait_errno,
-    });
+    // The native registration is gone before the last task-owned reference
+    // can close the original socket, including when cancellation drops this
+    // future before its next poll. The done callback keeps another reference
+    // until Python has checked SO_ERROR and completed the Future.
+    drop(socket_keepalive);
+    if !wake.done.load(Ordering::Acquire) {
+        let _ = core.send_command(LoopCommand::ConnectCompleted {
+            future,
+            fd,
+            wait_errno,
+        });
+    }
 }

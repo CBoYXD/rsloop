@@ -9,14 +9,14 @@ use mio::Interest;
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{ERROR_IO_PENDING, HANDLE},
-    Networking::WinSock::{self as WinSock, SOCKET, WSA_IO_PENDING, WSABUF},
+    Networking::WinSock::{self as WinSock, SOCKET, WSA_IO_PENDING},
     Storage::FileSystem::WriteFile,
     System::IO::OVERLAPPED,
 };
 
 #[cfg(windows)]
 use crate::vibeio::fd_inner::RawOsHandle;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use crate::vibeio::op::io_util::iovec_to_system;
 use crate::vibeio::{
     driver::{AnyDriver, CompletionIoResult},
@@ -24,7 +24,7 @@ use crate::vibeio::{
     io::IoVectoredBuf,
     op::{
         Op,
-        io_util::{iovec_count, poll_result_or_wait},
+        io_util::{NativeIoVecs, iovec_count, poll_result_or_wait},
     },
 };
 
@@ -32,22 +32,10 @@ use crate::vibeio::{
 #[cfg(windows)]
 #[inline]
 fn socket_write_vectored<B: IoVectoredBuf>(socket: SOCKET, bufs: &B) -> io::Result<usize> {
-    use windows_sys::Win32::Networking::WinSock::{self as WinSock, SOCKET_ERROR, WSABUF};
+    use windows_sys::Win32::Networking::WinSock::{self as WinSock, SOCKET_ERROR};
 
     let iovecs = bufs.as_iovecs();
-    let mut wsabufs = Vec::with_capacity(iovecs.len());
-    for iovec in iovecs {
-        let len = crate::vibeio::op::io_util::completion_len(iovec.len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "writev buffer is too large for Windows socket I/O",
-            )
-        })?;
-        wsabufs.push(WSABUF {
-            len,
-            buf: iovec.ptr as *mut _,
-        });
-    }
+    let mut wsabufs = NativeIoVecs::new(&iovecs)?;
 
     let mut bytes: u32 = 0;
     // SAFETY: IoVectoredBuf owns initialized, stable payloads. The checked
@@ -127,13 +115,13 @@ impl<B: IoVectoredBuf> Op for WritevOp<'_, B> {
         #[cfg(unix)]
         let result = {
             let iovecs = bufs.as_iovecs();
-            let iovecs_system = iovec_to_system(&iovecs);
+            let mut iovecs_system = NativeIoVecs::new(&iovecs)?;
             // SAFETY: every descriptor refers to initialized memory owned by
             // bufs, and both payloads and descriptor array outlive this call.
             let written = unsafe {
                 libc::writev(
                     self.handle.handle,
-                    iovecs_system.as_ptr(),
+                    iovecs_system.as_mut_ptr(),
                     iovec_count(iovecs_system.len())?,
                 )
             };
@@ -215,23 +203,10 @@ impl<B: IoVectoredBuf> Op for WritevOp<'_, B> {
                 crate::vibeio::op::io_util::completion_vectored_len(
                     iovecs.iter().map(|iov| iov.len),
                 )?;
-                let mut wsabufs = Vec::with_capacity(iovecs.len());
-                for iovec in iovecs {
-                    let len =
-                        crate::vibeio::op::io_util::completion_len(iovec.len).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "writev buffer is too large for Windows socket I/O",
-                            )
-                        })?;
-                    wsabufs.push(WSABUF {
-                        len,
-                        buf: iovec.ptr as *mut _,
-                    });
-                }
+                let mut wsabufs = NativeIoVecs::new(&iovecs)?;
 
                 // SAFETY: Winsock captures the WSABUF descriptors before
-                // return. Their Vec need only survive this
+                // return. Their descriptor storage need only survive this
                 // call; payloads remain owned
                 // through completion/cancellation, and the driver retains the
                 // OVERLAPPED until acknowledgement.

@@ -91,6 +91,76 @@ mod retirement_tests {
     }
 
     #[test]
+    fn packets_enter_reuse_pools_only_after_completion_acknowledgement() {
+        let driver = IocpDriver::new().unwrap();
+        let (completion_pointer, poll_pointer) = {
+            let mut state = driver.state.borrow_mut();
+            let token = state.completions.vacant_key();
+            let mut packet = Box::new(OverlappedCtx {
+                overlapped: OVERLAPPED::default(),
+                token,
+            });
+            let completion_pointer = &mut packet.overlapped as *mut OVERLAPPED;
+            state.completions.insert(Completion {
+                waiter: None,
+                completed: None,
+                overlapped: Some(packet),
+                ignored_data: None,
+            });
+            let token = state.poll_ops.vacant_key();
+            let mut packet = Box::new(AfdPollPacket {
+                io_status: IO_STATUS_BLOCK::default(),
+                token,
+                info: AfdPollInfo::new(0, 0),
+            });
+            let poll_pointer = (&mut packet.io_status as *mut IO_STATUS_BLOCK).cast();
+            state.poll_ops.insert(PollOp {
+                registration_token: usize::MAX,
+                registration_generation: 0,
+                packet,
+            });
+            assert!(state.free_overlapped.is_empty());
+            assert!(state.free_poll_packets.is_empty());
+            (completion_pointer, poll_pointer)
+        };
+        driver.process_entries(&[
+            OVERLAPPED_ENTRY {
+                lpOverlapped: completion_pointer,
+                ..OVERLAPPED_ENTRY::default()
+            },
+            OVERLAPPED_ENTRY {
+                lpCompletionKey: AFD_POLL_COMPLETION_KEY,
+                lpOverlapped: poll_pointer,
+                ..OVERLAPPED_ENTRY::default()
+            },
+        ]);
+        let mut state = driver.state.borrow_mut();
+        let mut completion = state
+            .free_overlapped
+            .pop()
+            .expect("acknowledged completion reusable");
+        let mut poll = state
+            .free_poll_packets
+            .pop()
+            .expect("acknowledged AFD packet reusable");
+        assert_eq!(
+            &mut completion.overlapped as *mut OVERLAPPED,
+            completion_pointer
+        );
+        assert_eq!(
+            (&mut poll.io_status as *mut IO_STATUS_BLOCK).cast::<OVERLAPPED>(),
+            poll_pointer
+        );
+        assert!(state.poll_ops.is_empty());
+        assert!(
+            state
+                .completions
+                .iter()
+                .all(|(_, op)| op.overlapped.is_none())
+        );
+    }
+
+    #[test]
     fn failed_submission_drops_waker_outside_state_borrow() {
         struct UnsupportedOp;
         impl Op for UnsupportedOp {
@@ -185,6 +255,8 @@ mod retirement_tests {
             completions: Slab::new(),
             poll_ops: Slab::new(),
             next_registration_generation: 0,
+            free_overlapped: Vec::new(),
+            free_poll_packets: Vec::new(),
         };
         let token = state.completions.vacant_key();
         let mut ctx = Box::new(OverlappedCtx {
@@ -488,17 +560,16 @@ struct OverlappedCtx {
 }
 
 #[repr(C)]
-struct AfdIoStatusCtx {
+struct AfdPollPacket {
     io_status: IO_STATUS_BLOCK,
     token: usize,
+    info: AfdPollInfo,
 }
 
 struct PollOp {
     registration_token: usize,
     registration_generation: u64,
-    io_status: Box<AfdIoStatusCtx>,
-    _input: Box<AfdPollInfo>,
-    _output: Box<AfdPollInfo>,
+    packet: Box<AfdPollPacket>,
 }
 
 struct PollRegistration {
@@ -514,11 +585,17 @@ enum HandleRegistration {
     Poll(PollRegistration),
 }
 
+#[allow(
+    clippy::vec_box,
+    reason = "kernel-visible packets require stable addresses across pool growth"
+)]
 struct DriverState {
     registrations: Slab<HandleRegistration>,
     completions: Slab<Completion>,
     poll_ops: Slab<PollOp>,
     next_registration_generation: u64,
+    free_overlapped: Vec<Box<OverlappedCtx>>,
+    free_poll_packets: Vec<Box<AfdPollPacket>>,
 }
 
 impl DriverState {
@@ -557,6 +634,8 @@ pub struct IocpDriver {
     port: Arc<OwnedHandle>,
     afd: RefCell<Option<OwnedHandle>>,
     state: RefCell<DriverState>,
+    ready_wakers: RefCell<Vec<Waker>>,
+    retired_completions: RefCell<Vec<Completion>>,
 }
 
 impl Drop for IocpDriver {
@@ -649,11 +728,15 @@ impl IocpDriver {
             // this is its sole owning wrapper, shared only through the Arc.
             port: Arc::new(unsafe { OwnedHandle::from_raw_handle(port as RawHandle) }),
             afd: RefCell::new(None),
+            ready_wakers: RefCell::new(Vec::new()),
+            retired_completions: RefCell::new(Vec::new()),
             state: RefCell::new(DriverState {
                 registrations: Slab::with_capacity(1024),
                 completions: Slab::with_capacity(1024),
                 poll_ops: Slab::with_capacity(1024),
                 next_registration_generation: 0,
+                free_overlapped: Vec::new(),
+                free_poll_packets: Vec::new(),
             }),
         })
     }
@@ -954,26 +1037,25 @@ impl IocpDriver {
                 }
             };
 
-            let mut input = Box::new(AfdPollInfo::new(socket, poll_events));
-            let mut output = Box::new(AfdPollInfo::new(socket, 0));
-
+            let mut packet = state.free_poll_packets.pop().unwrap_or_else(|| {
+                Box::new(AfdPollPacket {
+                    io_status: IO_STATUS_BLOCK::default(),
+                    token: 0,
+                    info: AfdPollInfo::new(socket, poll_events),
+                })
+            });
             let poll_entry = state.poll_ops.vacant_entry();
             let poll_token = poll_entry.key();
-            let mut io_status = Box::new(AfdIoStatusCtx {
-                io_status: IO_STATUS_BLOCK::default(),
-                token: poll_token,
-            });
-
-            let io_status_ptr = &mut io_status.io_status as *mut IO_STATUS_BLOCK;
-            let input_ptr = (&mut *input as *mut AfdPollInfo).cast();
-            let output_ptr = (&mut *output as *mut AfdPollInfo).cast();
-
+            packet.io_status = IO_STATUS_BLOCK::default();
+            packet.token = poll_token;
+            packet.info = AfdPollInfo::new(socket, poll_events);
+            let io_status_ptr = &mut packet.io_status as *mut IO_STATUS_BLOCK;
+            let input_ptr = (&mut packet.info as *mut AfdPollInfo).cast();
+            let output_ptr = input_ptr;
             poll_entry.insert(PollOp {
                 registration_token,
                 registration_generation,
-                io_status,
-                _input: input,
-                _output: output,
+                packet,
             });
             if let Some(HandleRegistration::Poll(registration)) =
                 state.registrations.get_mut(registration_token)
@@ -985,10 +1067,11 @@ impl IocpDriver {
         };
 
         // SAFETY: afd_handle is owned by this driver. The status, input and
-        // output pointers refer to separate boxed allocations already stored
-        // in poll_ops, and their lengths match AfdPollInfo. The completion
-        // context is the status allocation's address. None of those allocations
-        // is released merely because this submission is pending or cancelled.
+        // output pointers share one AFD poll-info buffer, as supported by AFD
+        // and used by mio's native Windows backend. The status/header and info
+        // are in one stable boxed packet owned by poll_ops. None of that
+        // storage is released merely because this submission is pending
+        // or cancelled.
         let status = unsafe {
             NtDeviceIoControlFile(
                 afd_handle,
@@ -1009,7 +1092,11 @@ impl IocpDriver {
         }
 
         let mut state = self.state.borrow_mut();
-        let _ = state.poll_ops.try_remove(poll_token);
+        if let Some(op) = state.poll_ops.try_remove(poll_token) {
+            if state.free_poll_packets.len() < 1024 {
+                state.free_poll_packets.push(op.packet);
+            }
+        }
         if let Some(HandleRegistration::Poll(registration)) =
             state.registrations.get_mut(registration_token)
         {
@@ -1037,7 +1124,7 @@ impl IocpDriver {
             let Some(poll_op) = state.poll_ops.get(poll_token) else {
                 return;
             };
-            &poll_op.io_status.io_status as *const IO_STATUS_BLOCK
+            &poll_op.packet.io_status as *const IO_STATUS_BLOCK
         };
 
         let mut cancel_status = IO_STATUS_BLOCK::default();
@@ -1082,8 +1169,8 @@ impl IocpDriver {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "IocpDriver"))]
     #[inline]
     fn process_entries(&self, entries: &[OVERLAPPED_ENTRY]) {
-        let mut wakers = Vec::new();
-        let mut retired = Vec::new();
+        let mut wakers = std::mem::take(&mut *self.ready_wakers.borrow_mut());
+        let mut retired = std::mem::take(&mut *self.retired_completions.borrow_mut());
         let mut state = self.state.borrow_mut();
         for entry in entries {
             if entry.lpCompletionKey == INTERRUPT_KEY {
@@ -1096,14 +1183,18 @@ impl IocpDriver {
                 }
 
                 // SAFETY: every AFD poll submission passes a pointer to
-                // AfdIoStatusCtx::io_status, and AfdIoStatusCtx is repr(C) with
+                // AfdPollPacket::io_status, and AfdPollPacket is repr(C) with
                 // io_status as its first field.
-                let poll_token = unsafe { (*entry.lpOverlapped.cast::<AfdIoStatusCtx>()).token };
+                let poll_token = unsafe { (*entry.lpOverlapped.cast::<AfdPollPacket>()).token };
                 let registration = state
                     .poll_ops
                     .get(poll_token)
                     .map(|poll| (poll.registration_token, poll.registration_generation));
-                let _ = state.poll_ops.try_remove(poll_token);
+                if let Some(op) = state.poll_ops.try_remove(poll_token) {
+                    if state.free_poll_packets.len() < 1024 {
+                        state.free_poll_packets.push(op.packet);
+                    }
+                }
 
                 if let Some((registration_token, generation)) = registration {
                     if let Some(HandleRegistration::Poll(registration)) =
@@ -1133,21 +1224,30 @@ impl IocpDriver {
             let completion_token = unsafe { (*entry.lpOverlapped.cast::<OverlappedCtx>()).token };
             if let Some(completion) = state.completions.get_mut(completion_token) {
                 completion.completed = Some(Self::completion_result_from_entry(entry));
-                completion.overlapped = None;
+                let reusable = completion.overlapped.take();
                 if let Some(waiter) = completion.waiter.take() {
                     wakers.push(waiter);
                 }
                 if completion.ignored_data.is_some() {
                     retired.push(state.completions.remove(completion_token));
                 }
+                if let Some(packet) = reusable {
+                    if state.free_overlapped.len() < 1024 {
+                        state.free_overlapped.push(packet);
+                    }
+                }
             }
         }
         // Wakers and retained payload destructors can re-enter the driver.
         drop(state);
-        drop(retired);
-        for waker in wakers {
+        retired.clear();
+        for waker in wakers.drain(..) {
             waker.wake();
         }
+        // Both buffers are empty, so replacing a reentrantly filled cache
+        // cannot invoke user destructors under a RefCell borrow.
+        *self.ready_wakers.borrow_mut() = wakers;
+        *self.retired_completions.borrow_mut() = retired;
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "IocpDriver"))]
@@ -1420,13 +1520,16 @@ impl Driver for IocpDriver {
     {
         let (completion_token, overlapped_ptr) = {
             let mut state = self.state.borrow_mut();
+            let mut overlapped = state.free_overlapped.pop().unwrap_or_else(|| {
+                Box::new(OverlappedCtx {
+                    overlapped: OVERLAPPED::default(),
+                    token: 0,
+                })
+            });
             let vacant_completion = state.completions.vacant_entry();
             let completion_token = vacant_completion.key();
-
-            let mut overlapped = Box::new(OverlappedCtx {
-                overlapped: OVERLAPPED::default(),
-                token: completion_token,
-            });
+            overlapped.overlapped = OVERLAPPED::default();
+            overlapped.token = completion_token;
             let overlapped_ptr: *mut OVERLAPPED = &mut overlapped.overlapped;
 
             vacant_completion.insert(Completion {

@@ -28,7 +28,7 @@ use crate::vibeio::{
     fd_inner::{InnerRawHandle, set_nonblocking},
     io::{
         AsInnerRawHandle, AsyncRead, AsyncWrite, IoBuf, IoBufMut, IoBufTemporaryPoll,
-        IoVectoredBuf, IoVectoredBufMut, IoVectoredBufTemporaryPoll,
+        IoVectoredBuf, IoVectoredBufMut,
     },
     op::{ReadOp, ReadvOp, WriteOp, WritevOp},
 };
@@ -506,13 +506,26 @@ impl TokioAsyncWrite for PollPipe {
             return Poll::Ready(Ok(0));
         }
         let this = self.get_mut();
-        // SAFETY: IoSlice data stays borrowed and initialized for this poll.
-        // Only descriptor metadata is copied; WritevOp does synchronous poll
-        // I/O through poll_op_poll and cannot retain these buffers
-        // after returning.
-        let bufs = unsafe { IoVectoredBufTemporaryPoll::new(bufs) };
-        let mut op = WritevOp::new(&this.stream.handle, bufs);
-        this.stream.handle.poll_op_poll(cx, &mut op)
+        // Borrow the initialized IoSlice descriptors directly; the OS cannot
+        // retain them after this synchronous writev call returns.
+        this.stream.handle.poll_io(cx, Interest::WRITABLE, || {
+            // SAFETY: IoSlice has the same layout as libc::iovec on Unix;
+            // every payload remains borrowed throughout this call.
+            let written = unsafe {
+                libc::writev(
+                    this.stream.inner.as_raw_fd(),
+                    bufs.as_ptr().cast(),
+                    i32::try_from(bufs.len()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "too many I/O vectors")
+                    })?,
+                )
+            };
+            if written == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(written as usize)
+            }
+        })
     }
 
     #[cfg_attr(

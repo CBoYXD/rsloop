@@ -9,14 +9,14 @@ use mio::Interest;
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{ERROR_IO_PENDING, HANDLE},
-    Networking::WinSock::{self as WinSock, SOCKET, WSA_IO_PENDING, WSABUF},
+    Networking::WinSock::{self as WinSock, SOCKET, WSA_IO_PENDING},
     Storage::FileSystem::ReadFile,
     System::IO::OVERLAPPED,
 };
 
 #[cfg(windows)]
 use crate::vibeio::fd_inner::RawOsHandle;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use crate::vibeio::op::io_util::iovec_to_system;
 use crate::vibeio::{
     driver::{AnyDriver, CompletionIoResult},
@@ -24,7 +24,7 @@ use crate::vibeio::{
     io::IoVectoredBufMut,
     op::{
         Op,
-        io_util::{iovec_count, poll_result_or_wait},
+        io_util::{NativeIoVecs, iovec_count, poll_result_or_wait},
     },
 };
 
@@ -32,22 +32,10 @@ use crate::vibeio::{
 #[cfg(windows)]
 #[inline]
 fn socket_read_vectored<B: IoVectoredBufMut>(socket: SOCKET, bufs: &mut B) -> io::Result<usize> {
-    use windows_sys::Win32::Networking::WinSock::{self as WinSock, SOCKET_ERROR, WSABUF};
+    use windows_sys::Win32::Networking::WinSock::{self as WinSock, SOCKET_ERROR};
 
     let iovecs = bufs.as_iovecs_mut();
-    let mut wsabufs = Vec::with_capacity(iovecs.len());
-    for iovec in iovecs {
-        let len = crate::vibeio::op::io_util::completion_len(iovec.len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "readv buffer is too large for Windows socket I/O",
-            )
-        })?;
-        wsabufs.push(WSABUF {
-            len,
-            buf: iovec.ptr as *mut _,
-        });
-    }
+    let mut wsabufs = NativeIoVecs::new(&iovecs)?;
 
     let mut bytes: u32 = 0;
     let mut flags: u32 = 0;
@@ -126,7 +114,7 @@ impl<B: IoVectoredBufMut> Op for ReadvOp<'_, B> {
         let bufs = self.bufs.as_mut().unwrap();
         #[cfg(unix)]
         let result = {
-            let mut iovecs = iovec_to_system(&bufs.as_iovecs_mut());
+            let mut iovecs = NativeIoVecs::new(&bufs.as_iovecs_mut())?;
             // SAFETY: the owned buffer provides disjoint writable regions;
             // descriptors remain live through this synchronous call and their
             // count is checked before conversion to the native integer type.
@@ -246,20 +234,7 @@ impl<B: IoVectoredBufMut> Op for ReadvOp<'_, B> {
                 crate::vibeio::op::io_util::completion_vectored_len(
                     iovecs.iter().map(|iov| iov.len),
                 )?;
-                let mut wsabufs = Vec::with_capacity(iovecs.len());
-                for iovec in iovecs {
-                    let len =
-                        crate::vibeio::op::io_util::completion_len(iovec.len).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "readv buffer is too large for Windows socket I/O",
-                            )
-                        })?;
-                    wsabufs.push(WSABUF {
-                        len,
-                        buf: iovec.ptr as *mut _,
-                    });
-                }
+                let mut wsabufs = NativeIoVecs::new(&iovecs)?;
 
                 let mut flags = 0u32;
                 // SAFETY: Winsock captures the WSABUF array during submission;

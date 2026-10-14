@@ -16,7 +16,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
-    net::TcpStream as StdTcpStream,
     os::raw::c_int,
     sync::{
         Arc, Condvar, Mutex, Weak,
@@ -52,19 +51,15 @@ pub(super) fn detached_socket_handle(
 }
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
-pub(super) fn tcp_family(stream: &StdTcpStream) -> c_int {
+pub(super) fn tcp_family(ipv6: bool) -> c_int {
+    #[cfg(unix)]
+    {
+        if ipv6 { libc::AF_INET6 } else { libc::AF_INET }
+    }
     #[cfg(windows)]
-    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
-
-    match stream.local_addr() {
-        #[cfg(unix)]
-        Ok(addr) if addr.is_ipv6() => libc::AF_INET6,
-        #[cfg(unix)]
-        _ => libc::AF_INET,
-        #[cfg(windows)]
-        Ok(addr) if addr.is_ipv6() => c_int::from(AF_INET6),
-        #[cfg(windows)]
-        _ => c_int::from(AF_INET),
+    {
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+        c_int::from(if ipv6 { AF_INET6 } else { AF_INET })
     }
 }
 pub(super) struct StreamTransportStateConfig {
@@ -156,7 +151,7 @@ pub(super) fn new_stream_transport_core(
     Arc::new(StreamTransportCore {
         loop_core: parts.loop_core,
         loop_obj: parts.loop_obj,
-        state: Mutex::new(parts.state),
+        state: crate::state_snapshot::SnapshotMutex::new(parts.state),
         pending_read_events: Mutex::new(VecDeque::with_capacity(
             super::tuning::READ_BUFFER_POOL_LIMIT + 4,
         )),
@@ -187,6 +182,8 @@ pub(super) fn new_stream_transport_core(
         #[cfg(windows)]
         server_side,
         coalesce_small_writes,
+        small_write_turn: std::sync::atomic::AtomicU64::new(u64::MAX),
+        small_writes_this_turn: AtomicU8::new(0),
     })
 }
 

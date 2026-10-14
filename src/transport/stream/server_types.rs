@@ -19,7 +19,7 @@ pub enum ServerListener {
 }
 
 pub enum AcceptedStream {
-    Tcp(TcpStream),
+    Tcp(TcpStream, bool),
     #[cfg(unix)]
     Unix(UnixStream),
 }

@@ -46,6 +46,22 @@ fn recycle_callback_context(py: Python<'_>, context: Py<PyAny>) {
     let _ = (py, context);
 }
 
+/// An owned FFI result whose destructor runs after context exit, matching the
+/// observable finalizer timing of the ordinary Py-object return path.
+struct CallbackResult<'py> {
+    pointer: *mut pyo3::ffi::PyObject,
+    _python: std::marker::PhantomData<Python<'py>>,
+}
+impl Drop for CallbackResult<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this owns a nonnull result reference; the Python lifetime
+        // prevents moving its destruction outside the attached invocation.
+        unsafe {
+            pyo3::ffi::Py_DECREF(self.pointer);
+        }
+    }
+}
+
 pub type CallbackId = u64;
 
 #[inline]
@@ -229,8 +245,19 @@ impl<const SOURCE_WORDS: usize> ReadyCallback<SOURCE_WORDS> {
     /// means the desired context is already active on this thread.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ReadyCallback"))]
     pub fn invoke(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.invoke_with(py, |ready| ready.invoke_direct(py))
+    }
+
+    /// Invoke a scheduled callback and release its result after context exit.
+    pub fn invoke_discard(&self, py: Python<'_>) -> PyResult<()> {
+        let result = self.invoke_with(py, |ready| ready.invoke_direct_raw(py))?;
+        drop(result);
+        Ok(())
+    }
+
+    fn invoke_with<R>(&self, py: Python<'_>, call: impl Fn(&Self) -> PyResult<R>) -> PyResult<R> {
         if !self.context_needs_run {
-            return self.invoke_direct(py);
+            return call(self);
         }
 
         // Only implicitly empty, one-shot callback contexts use the marker.
@@ -244,13 +271,13 @@ impl<const SOURCE_WORDS: usize> ReadyCallback<SOURCE_WORDS> {
         let context = empty_context.as_ref().unwrap_or(&self.context);
         if let Err(err) = enter_context(py, context) {
             return if is_nested_context_error(py, &err) {
-                self.invoke_direct(py)
+                call(self)
             } else {
                 Err(err)
             };
         }
 
-        let callback_result = self.invoke_direct(py);
+        let callback_result = call(self);
         let exit_result = exit_context(py, context);
         if exit_result.is_ok()
             && let Some(context) = empty_context
@@ -261,6 +288,44 @@ impl<const SOURCE_WORDS: usize> ReadyCallback<SOURCE_WORDS> {
         match (callback_result, exit_result) {
             (Ok(result), Ok(())) => Ok(result),
             (Err(err), _) | (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
+    fn invoke_direct_raw<'py>(&self, py: Python<'py>) -> PyResult<CallbackResult<'py>> {
+        // SAFETY: the callback and stored arguments remain owned by self. The
+        // inline arrays and tuple are valid for the synchronous call, which
+        // returns one owned reference or sets a Python exception on null.
+        let pointer = unsafe {
+            match &self.args {
+                None => pyo3::ffi::PyObject_Vectorcall(
+                    self.callback.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                Some(arg) if !self.args_are_tuple => {
+                    let args = [arg.as_ptr()];
+                    pyo3::ffi::PyObject_Vectorcall(
+                        self.callback.as_ptr(),
+                        args.as_ptr(),
+                        1,
+                        std::ptr::null_mut(),
+                    )
+                }
+                Some(args) => pyo3::ffi::PyObject_Call(
+                    self.callback.as_ptr(),
+                    args.as_ptr(),
+                    std::ptr::null_mut(),
+                ),
+            }
+        };
+        if pointer.is_null() {
+            Err(PyErr::fetch(py))
+        } else {
+            Ok(CallbackResult {
+                pointer,
+                _python: std::marker::PhantomData,
+            })
         }
     }
 

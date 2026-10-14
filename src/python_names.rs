@@ -91,3 +91,23 @@ pub(crate) fn call_method1(
 ) -> PyResult<Py<PyAny>> {
     Ok(obj.call_method1(method, (arg,))?.unbind())
 }
+
+macro_rules! interned_name {
+    ($name:ident, $value:literal) => {
+        #[cfg_attr(feature = "profile", hotpath::measure)]
+        pub(crate) fn $name<'py>(py: Python<'py>) -> &'py Bound<'py, PyString> {
+            pyo3::intern!(py, $value)
+        }
+    };
+}
+interned_name!(eof_attr, "_eof");
+interned_name!(waiter_attr, "_waiter");
+interned_name!(transport_attr, "_transport");
+interned_name!(paused_attr, "_paused");
+interned_name!(recv, "recv");
+interned_name!(recv_into, "recv_into");
+interned_name!(accept, "accept");
+interned_name!(send, "send");
+interned_name!(setblocking, "setblocking");
+interned_name!(gettimeout, "gettimeout");
+interned_name!(add_done_callback, "add_done_callback");

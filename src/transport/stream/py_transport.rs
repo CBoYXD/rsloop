@@ -21,6 +21,40 @@ use super::{
     stop_socket_reader_nowait,
 };
 
+/// The initialized prefix owns its Python references; unused slots require no
+/// INCREF/DECREF and allocation is reserved for arbitrary longer iterables.
+struct InlineWriteSegments<'py> {
+    items: [std::mem::MaybeUninit<Bound<'py, PyBytes>>; 16],
+    len: usize,
+}
+impl<'py> InlineWriteSegments<'py> {
+    fn new() -> Self {
+        Self {
+            items: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
+            len: 0,
+        }
+    }
+    fn push(&mut self, value: Bound<'py, PyBytes>) {
+        self.items[self.len].write(value);
+        self.len += 1;
+    }
+    fn as_slice(&self) -> &[Bound<'py, PyBytes>] {
+        // SAFETY: push initializes each prefix element before increasing len;
+        // MaybeUninit<T> has T's layout, and this immutable borrow retains it.
+        unsafe { std::slice::from_raw_parts(self.items.as_ptr().cast(), self.len) }
+    }
+}
+impl Drop for InlineWriteSegments<'_> {
+    fn drop(&mut self) {
+        for item in &mut self.items[..self.len] {
+            // SAFETY: exactly the initialized prefix contains owned values.
+            unsafe {
+                item.assume_init_drop();
+            }
+        }
+    }
+}
+
 impl PyStreamTransport {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PyStreamTransport"))]
     pub(crate) fn write_data(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -88,9 +122,7 @@ impl PyStreamTransport {
         let mut bytes_type = None;
         // Keep metadata for the bounded scatter/gather batch on the stack.
         // Larger arbitrary iterables retain the heap-backed fallback.
-        let empty = PyBytes::new(py, b"");
-        let mut inline: [_; 16] = std::array::from_fn(|_| empty.clone());
-        let mut count = 0;
+        let mut inline = InlineWriteSegments::new();
         let mut overflow: Option<Vec<Bound<'_, PyBytes>>> = None;
         let mut len = 0_usize;
         for item in seq.try_iter()? {
@@ -110,20 +142,17 @@ impl PyStreamTransport {
             if !bytes.as_bytes().is_empty() {
                 if let Some(segments) = overflow.as_mut() {
                     segments.push(bytes);
-                } else if count < inline.len() {
-                    inline[count] = bytes;
+                } else if inline.len < inline.items.len() {
+                    inline.push(bytes);
                 } else {
-                    let mut segments = Vec::with_capacity(inline.len() * 2);
-                    segments.extend(inline.iter().cloned());
+                    let mut segments = Vec::with_capacity(inline.items.len() * 2);
+                    segments.extend(inline.as_slice().iter().cloned());
                     segments.push(bytes);
                     overflow = Some(segments);
                 }
-                count += 1;
             }
         }
-        let segments = overflow
-            .as_deref()
-            .unwrap_or(&inline[..count.min(inline.len())]);
+        let segments = overflow.as_deref().unwrap_or(inline.as_slice());
         self.core
             .try_write_segments(segments, len)
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;

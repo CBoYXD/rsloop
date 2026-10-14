@@ -44,7 +44,7 @@ use crate::vibeio::process::{ZombieReaperMessage, start_zombie_reaper};
 use crate::vibeio::{
     batch_allocator::{Batch, BatchAllocator, batch, drain_batch},
     blocking::{BlockingThreadPool, SpawnBlockingError},
-    driver::{AnyDriver, AnyInterruptor},
+    driver::AnyDriver,
     task::{RemoteWakeContext, Task, TaskWake},
 };
 
@@ -244,25 +244,17 @@ impl<T> Future for JoinHandle<T> {
 struct BlockOnNotify {
     ready: AtomicBool,
     thread_id: std::thread::ThreadId,
-    interruptor: AnyInterruptor,
-    waiting: Arc<AtomicBool>,
-    interrupt_pending: Arc<AtomicBool>,
+    remote_wake: Arc<RemoteWakeContext>,
 }
 
 impl BlockOnNotify {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "BlockOnNotify"))]
     #[inline]
-    fn new(
-        interruptor: AnyInterruptor,
-        waiting: Arc<AtomicBool>,
-        interrupt_pending: Arc<AtomicBool>,
-    ) -> Arc<Self> {
+    fn new(remote_wake: Arc<RemoteWakeContext>) -> Arc<Self> {
         Arc::new(Self {
             ready: AtomicBool::new(true),
             thread_id: std::thread::current().id(),
-            interruptor,
-            waiting,
-            interrupt_pending,
+            remote_wake,
         })
     }
 
@@ -291,10 +283,13 @@ impl BlockOnNotify {
         self.ready.store(true, Ordering::Release);
 
         if std::thread::current().id() != self.thread_id
-            && self.waiting.load(Ordering::Acquire)
-            && !self.interrupt_pending.swap(true, Ordering::AcqRel)
+            && self.remote_wake.waiting.load(Ordering::Acquire)
+            && !self
+                .remote_wake
+                .interrupt_pending
+                .swap(true, Ordering::AcqRel)
         {
-            self.interruptor.interrupt();
+            self.remote_wake.interruptor.interrupt();
         }
     }
 
@@ -396,9 +391,9 @@ pub(crate) fn current_timer() -> Option<Rc<Timer>> {
 ///
 /// Returns `None` if called outside a runtime context or if process support is
 /// not enabled.
-#[cfg_attr(feature = "profile", hotpath::measure(future = true))]
+#[cfg_attr(feature = "profile", hotpath::measure)]
 #[cfg(feature = "process")]
-pub(crate) async fn current_zombie_reaper() -> Option<async_channel::Sender<ZombieReaperMessage>> {
+pub(crate) fn current_zombie_reaper() -> Option<async_channel::Sender<ZombieReaperMessage>> {
     let runtime = CURRENT_RUNTIME.with(|runtime| {
         let runtime = runtime.borrow();
         runtime.as_ref().map(|runtime_inner| runtime_inner.clone())
@@ -516,6 +511,24 @@ pub struct Runtime {
 
 impl RuntimeInner {
     /// Spawn a task on this runtime.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "RuntimeInner"))]
+    fn spawn_detached(&self, future: impl Future<Output = ()> + 'static) {
+        let mut slab = self.token_to_task.borrow_mut();
+        let vacant = slab.vacant_entry();
+        let task = Rc::new(Task {
+            future: RefCell::new(Some(Box::pin(future))),
+            wake: Arc::new(TaskWake {
+                remote_wake: Arc::downgrade(&self.remote_wake),
+                queued: AtomicBool::new(true),
+                token: vacant.key(),
+            }),
+            token: vacant.key(),
+        });
+        vacant.insert(task.clone());
+        drop(slab);
+        self.enqueue(task);
+    }
+
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "RuntimeInner"))]
     #[inline]
     pub(crate) fn spawn<T>(&self, future: impl Future<Output = T> + 'static) -> JoinHandle<T>
@@ -725,14 +738,10 @@ impl Runtime {
         let remote_wake = Arc::new(RemoteWakeContext {
             queue: Arc::new(SegQueue::new()),
             interruptor: driver.get_interruptor(),
-            waiting: Arc::new(AtomicBool::new(false)),
-            interrupt_pending: Arc::new(AtomicBool::new(false)),
+            waiting: AtomicBool::new(false),
+            interrupt_pending: AtomicBool::new(false),
         });
-        let root_notify = BlockOnNotify::new(
-            driver.get_interruptor(),
-            Arc::clone(&remote_wake.waiting),
-            Arc::clone(&remote_wake.interrupt_pending),
-        );
+        let root_notify = BlockOnNotify::new(Arc::clone(&remote_wake));
         let root_waker = root_notify.waker();
         Runtime {
             batch_allocator: BatchAllocator::default(),
@@ -773,6 +782,15 @@ impl Runtime {
             .as_ref()
             .expect("runtime has been dropped")
             .spawn(future)
+    }
+
+    /// Spawn work whose output is discarded without allocating a join state.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "Runtime"))]
+    pub fn spawn_detached(&self, future: impl Future<Output = ()> + 'static) {
+        self.inner
+            .as_ref()
+            .expect("runtime has been dropped")
+            .spawn_detached(future);
     }
 
     /// Spawn a blocking task on this runtime's thread pool.
@@ -852,6 +870,30 @@ impl Runtime {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "Runtime"))]
     #[inline]
     pub fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        self.drive(future, None)
+            .expect("unbounded root cannot expire")
+    }
+
+    /// Bound a root wait directly in the driver rather than allocating a Sleep
+    /// timer entry. Expiration drops the root future before returning.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "Runtime"))]
+    #[allow(
+        dead_code,
+        reason = "Used by the Python embedding, not the standalone runtime harness"
+    )]
+    pub(crate) fn block_on_until<T>(
+        &self,
+        future: impl Future<Output = T>,
+        deadline: std::time::Instant,
+    ) -> Option<T> {
+        self.drive(future, Some(deadline))
+    }
+
+    fn drive<T>(
+        &self,
+        future: impl Future<Output = T>,
+        root_deadline: Option<std::time::Instant>,
+    ) -> Option<T> {
         let inner = self.inner.as_ref().expect("runtime has been dropped");
         let _runtime_guard = CurrentRuntimeGuard::enter(inner.clone());
 
@@ -867,10 +909,13 @@ impl Runtime {
             if root_notify.take_ready() {
                 let mut context = Context::from_waker(root_waker);
                 if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
-                    return output;
+                    return Some(output);
                 }
             }
 
+            if root_deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
+                return None;
+            }
             batch.clear();
 
             let mut budget = inner.task_batch_size;
@@ -910,6 +955,14 @@ impl Runtime {
                     inner.stop_waiting();
                     continue;
                 }
+
+                let deadline = match root_deadline {
+                    Some(root) => {
+                        let remaining = root.saturating_duration_since(std::time::Instant::now());
+                        Some(deadline.map_or(remaining, |timer| timer.min(remaining)))
+                    }
+                    None => deadline,
+                };
 
                 #[cfg(any(target_vendor = "apple", windows))]
                 inner
@@ -984,6 +1037,60 @@ impl Drop for Runtime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn detached_tasks_complete_and_runtime_drop_releases_unpolled_tasks() {
+        use std::{cell::Cell, rc::Rc};
+        struct Guard(Rc<Cell<usize>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let runtime = super::Runtime::new(crate::vibeio::driver::AnyDriver::new_mock());
+        let completed = Rc::new(Cell::new(false));
+        let drops = Rc::new(Cell::new(0));
+        let guard = Guard(drops.clone());
+        let task_completed = completed.clone();
+        runtime.spawn_detached(async move {
+            let _guard = guard;
+            task_completed.set(true);
+        });
+        runtime.poll_once();
+        assert!(completed.get());
+        assert_eq!(drops.get(), 1);
+        let guard = Guard(drops.clone());
+        runtime.spawn_detached(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        drop(runtime);
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn expired_root_deadline_drops_borrowed_future_and_allows_next_root() {
+        use std::cell::Cell;
+        struct Guard<'a>(&'a Cell<bool>);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let runtime = super::Runtime::new(crate::vibeio::driver::AnyDriver::new_mock());
+        let dropped = Cell::new(false);
+        let guard = Guard(&dropped);
+        let result = runtime.block_on_until(
+            async {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            },
+            std::time::Instant::now(),
+        );
+        assert_eq!(result, None);
+        assert!(dropped.get());
+        assert_eq!(runtime.block_on(async { 42 }), 42);
+    }
+
     #[test]
     fn consecutive_block_on_calls_support_borrowed_roots_after_unwind() {
         use std::cell::Cell;
@@ -1095,7 +1202,7 @@ mod tests {
         drop(first);
     }
 
-    #[cfg(all(feature = "scheduler-batch-cache", not(kani)))]
+    #[cfg(not(kani))]
     #[test]
     fn repeated_runtime_turns_allocate_batch_storage_only_once() {
         let runtime = super::Runtime::new(crate::vibeio::driver::AnyDriver::new_mock());
@@ -1115,7 +1222,7 @@ mod tests {
         assert_eq!(allocator.system_allocations(), 1);
     }
 
-    #[cfg(all(feature = "scheduler-batch-cache", not(kani)))]
+    #[cfg(not(kani))]
     #[test]
     fn batch_poll_panic_releases_unpolled_task_owners() {
         let runtime = super::Runtime::new(crate::vibeio::driver::AnyDriver::new_mock());
@@ -1141,18 +1248,17 @@ mod tests {
     fn concurrent_reaper_requests_share_one_channel() {
         let runtime = super::Runtime::new(crate::vibeio::driver::AnyDriver::new_mock());
         runtime.block_on(async {
-            let (first, second) = futures_util::future::join(
+            let (first, second) = (
                 super::current_zombie_reaper(),
                 super::current_zombie_reaper(),
-            )
-            .await;
+            );
             let first = first.unwrap();
             let second = second.unwrap();
             assert!(
                 first.same_channel(&second),
                 "duplicate reapers were created"
             );
-            let cached = super::current_zombie_reaper().await.unwrap();
+            let cached = super::current_zombie_reaper().unwrap();
             assert!(first.same_channel(&cached));
         });
     }
@@ -1197,9 +1303,13 @@ mod tests {
     #[test]
     fn root_waker_preserves_ownership_and_local_notifications() {
         let driver = AnyDriver::new_mock();
-        let waiting = Arc::new(AtomicBool::new(true));
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let notify = BlockOnNotify::new(driver.get_interruptor(), waiting, interrupted.clone());
+        let remote = Arc::new(RemoteWakeContext {
+            queue: Arc::new(SegQueue::new()),
+            interruptor: driver.get_interruptor(),
+            waiting: AtomicBool::new(true),
+            interrupt_pending: AtomicBool::new(false),
+        });
+        let notify = BlockOnNotify::new(Arc::clone(&remote));
         assert!(notify.take_ready());
         let waker = notify.waker();
         let cloned = waker.clone();
@@ -1211,7 +1321,7 @@ mod tests {
         cloned.wake();
         assert!(notify.take_ready());
         assert_eq!(Arc::strong_count(&notify), 2);
-        assert!(!interrupted.load(Ordering::Acquire));
+        assert!(!remote.interrupt_pending.load(Ordering::Acquire));
         let weak = Arc::downgrade(&notify);
         drop(notify);
         assert!(weak.upgrade().is_some());
@@ -1222,12 +1332,13 @@ mod tests {
     #[test]
     fn root_waker_notifies_across_threads_without_consuming_borrowed_ownership() {
         let driver = AnyDriver::new_mock();
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let notify = BlockOnNotify::new(
-            driver.get_interruptor(),
-            Arc::new(AtomicBool::new(true)),
-            interrupted.clone(),
-        );
+        let remote = Arc::new(RemoteWakeContext {
+            queue: Arc::new(SegQueue::new()),
+            interruptor: driver.get_interruptor(),
+            waiting: AtomicBool::new(true),
+            interrupt_pending: AtomicBool::new(false),
+        });
+        let notify = BlockOnNotify::new(Arc::clone(&remote));
         notify.take_ready();
         let waker = notify.waker();
         let waker = std::thread::spawn(move || {
@@ -1238,7 +1349,7 @@ mod tests {
         .join()
         .unwrap();
         assert!(notify.take_ready());
-        assert!(interrupted.load(Ordering::Acquire));
+        assert!(remote.interrupt_pending.load(Ordering::Acquire));
         assert_eq!(Arc::strong_count(&notify), 2);
         let weak = Arc::downgrade(&notify);
         drop(notify);

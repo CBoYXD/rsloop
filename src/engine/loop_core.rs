@@ -28,7 +28,7 @@ use pyo3::{
 };
 
 #[cfg(unix)]
-use super::commands::{ConnectCompletion, TcpReaderStart};
+use super::commands::{ConnectCompletion, SocketReaderStart};
 use super::{
     callbacks::{CallbackArgs, CallbackId, CallbackKind, ReadyCallback, TimerCallback},
     commands::{
@@ -99,32 +99,13 @@ impl LoopWake {
     }
 }
 
-pin_project_lite::pin_project! {
-    /// The park primitive for the loop thread. `run_forever` drives this to
-    /// completion via `runtime.block_on` with the GIL released, so vibeio's reactor
-    /// (`driver.wait`) runs on the loop thread instead of a separate one. It
-    /// resolves when a ready item is enqueued (`LoopWake::signal`) or the
-    /// signal-poll timeout elapses, at which point `run_forever` re-acquires the
-    /// GIL and drains.
-    struct WaitForWake<'a> {
-        wake: &'a LoopWake,
-        #[pin]
-        sleep: crate::vibeio::time::Sleep,
-    }
+/// Root wait whose deadline is passed directly to the native driver.
+struct WaitForWake<'a> {
+    wake: &'a LoopWake,
 }
-
 impl<'a> WaitForWake<'a> {
-    #[cfg(test)]
-    fn new(wake: &'a LoopWake, timeout: Duration) -> Self {
-        Self::until(wake, Instant::now() + timeout)
-    }
-
-    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "WaitForWake"))]
-    fn until(wake: &'a LoopWake, deadline: Instant) -> Self {
-        Self {
-            wake,
-            sleep: crate::vibeio::time::Sleep::sleep_until(deadline),
-        }
+    fn new(wake: &'a LoopWake) -> Self {
+        Self { wake }
     }
 }
 
@@ -165,7 +146,7 @@ impl Future for WaitForWake<'_> {
     )]
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.project();
+        let this = self.get_mut();
         if this.wake.ready_pending.load(Ordering::Acquire) {
             return Poll::Ready(());
         }
@@ -173,9 +154,6 @@ impl Future for WaitForWake<'_> {
         // registration is never lost.
         this.wake.ready_waker.register(cx.waker());
         if this.wake.ready_pending.load(Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-        if this.sleep.poll(cx).is_ready() {
             return Poll::Ready(());
         }
         Poll::Pending
@@ -356,6 +334,13 @@ pub struct LoopState {
     pub task_factory: Option<Py<PyAny>>,
     pub exception_handler: Option<Py<PyAny>>,
     pub default_executor: Option<Py<PyAny>>,
+    pub bound_callbacks: Option<[Py<PyAny>; 3]>,
+}
+
+impl crate::state_snapshot::SnapshotFlags for LoopState {
+    fn snapshot_flags(&self) -> u8 {
+        u8::from(self.running) | (u8::from(self.stopping) << 1) | (u8::from(self.closed) << 2)
+    }
 }
 
 impl LoopState {
@@ -376,6 +361,7 @@ impl LoopState {
             task_factory: None,
             exception_handler: None,
             default_executor: None,
+            bound_callbacks: None,
         }
     }
 }
@@ -384,13 +370,14 @@ impl LoopState {
 /// transports.
 pub struct LoopCore {
     /// Mutable lifecycle and Python-facing configuration.
-    pub state: Mutex<LoopState>,
+    pub state: crate::state_snapshot::SnapshotMutex<LoopState>,
     /// Monotonic origin used by [`LoopCore::time`].
     pub start: Instant,
     /// Whether asyncio debug diagnostics are enabled.
     pub debug_enabled: AtomicBool,
     task_factory_installed: AtomicBool,
     next_callback_id: AtomicU64,
+    turn_number: AtomicU64,
     command_tx: Sender<LoopCommand>,
     runtime_thread: Mutex<Option<JoinHandle<()>>>,
     active_reactor: Mutex<Option<&'static str>>,
@@ -419,11 +406,12 @@ impl LoopCore {
     pub fn new() -> Arc<Self> {
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
         let core = Arc::new(Self {
-            state: Mutex::new(LoopState::new()),
+            state: crate::state_snapshot::SnapshotMutex::new(LoopState::new()),
             start: Instant::now(),
             debug_enabled: AtomicBool::new(false),
             task_factory_installed: AtomicBool::new(false),
             next_callback_id: AtomicU64::new(1),
+            turn_number: AtomicU64::new(0),
             command_tx,
             runtime_thread: Mutex::new(None),
             active_reactor: Mutex::new(None),
@@ -503,16 +491,21 @@ impl LoopCore {
         self.send_remote_command(LoopCommand::ScheduleReadyHandle(handle))
     }
 
+    #[inline]
+    pub(crate) fn current_turn(&self) -> u64 {
+        self.turn_number.load(Ordering::Relaxed)
+    }
+
     /// Reports whether a run session is currently active.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
     pub fn is_running(&self) -> bool {
-        self.state.lock().expect("poisoned loop state").running
+        self.state.flags() & 1 != 0
     }
 
     /// Reports whether this loop has been permanently closed.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
     pub fn is_closed(&self) -> bool {
-        self.state.lock().expect("poisoned loop state").closed
+        self.state.flags() & 4 != 0
     }
 
     /// Enables or disables asyncio debug diagnostics.
@@ -795,6 +788,7 @@ impl LoopCore {
         let mut consecutive_spins: u32 = 0;
         let mut spin_cooldown: u32 = 0;
         let run_result = loop {
+            self.turn_number.fetch_add(1, Ordering::Relaxed);
             // Handle destruction inside the lifecycle frame reuses its Python
             // attachment. Flush cross-thread deferred decrefs once per bounded
             // ready turn, outside queue/timer borrows so finalizers can
@@ -947,14 +941,27 @@ impl LoopCore {
                         core.flush_pending_direct_write();
                     }
                     #[cfg(unix)]
-                    ReadyItem::StartTcpReader(start) => {
-                        let TcpReaderStart { fd, core, stream } = *start;
-                        // The runtime is installed before the ready drain
-                        // begins.
-                        assert!(self.spawn_io_tracked(
-                            fd,
-                            crate::transport::stream::run_tcp_socket_reader_task(core, stream),
-                        ));
+                    ReadyItem::StartSocketReader(start) => {
+                        let SocketReaderStart { fd, core, reader } = *start;
+                        match reader {
+                            crate::transport::stream::ReaderTarget::Tcp(stream) => {
+                                assert!(self.spawn_io_tracked(
+                                    fd,
+                                    crate::transport::stream::run_tcp_socket_reader_task(
+                                        core, stream
+                                    )
+                                ));
+                            }
+                            crate::transport::stream::ReaderTarget::Unix(stream) => {
+                                assert!(self.spawn_io_tracked(
+                                    fd,
+                                    crate::transport::stream::run_unix_socket_reader_task(
+                                        core, stream
+                                    )
+                                ));
+                            }
+                            _ => unreachable!("only socket readers run locally"),
+                        }
                     }
                     ReadyItem::ProcessTransport(core) => {
                         core.drain_pending_events_with_py(py)?;
@@ -1010,7 +1017,7 @@ impl LoopCore {
                 if processed_this_turn >= MAX_READY_ITEMS_PER_TURN {
                     // stop() must not truncate callbacks already queued for
                     // this run merely because we reached the I/O budget.
-                    if !self.state.lock().expect("poisoned loop state").stopping {
+                    if self.state.flags() & 2 == 0 {
                         break;
                     }
                     #[cfg(all(not(Py_LIMITED_API), not(Py_GIL_DISABLED)))]
@@ -1028,7 +1035,7 @@ impl LoopCore {
                 break Err(err);
             }
 
-            if self.state.lock().expect("poisoned loop state").stopping {
+            if self.state.flags() & 2 != 0 {
                 break match pending_signal_error {
                     Some(err) => Err(err),
                     None => Ok(()),
@@ -1112,13 +1119,13 @@ impl LoopCore {
                     consecutive_spins += 1;
                 } else {
                     consecutive_spins = 0;
-                    let wait = WaitForWake::until(&self.wake, park_deadline);
+                    let wait = WaitForWake::new(&self.wake);
                     LOOP_RUNTIMES.with(|runtimes| {
                         let runtimes = runtimes.borrow();
                         let runtime = runtimes
                             .get(&loop_runtime_key)
                             .expect("loop runtime missing");
-                        runtime.block_on(wait);
+                        runtime.block_on_until(wait, park_deadline);
                     });
                 }
             });
@@ -1333,7 +1340,7 @@ impl LoopCore {
             return Ok(None);
         }
 
-        match ready.invoke(py) {
+        match ready.invoke_discard(py) {
             Ok(_) => Ok(None),
             Err(err) => handle_callback_error(
                 py,
@@ -1428,7 +1435,7 @@ impl LoopCore {
             match runtimes.get(&key) {
                 // Detach the JoinHandle: the task manages its own lifetime.
                 Some(runtime) => {
-                    std::mem::drop(runtime.spawn(future));
+                    runtime.spawn_detached(future);
                     true
                 }
                 None => false,
@@ -1615,28 +1622,25 @@ impl LoopCore {
                     _ => unreachable!("accept stop preserves item kind"),
                 }),
             #[cfg(unix)]
-            LoopCommand::Io(LoopIoCommand::StartSocketReader {
-                fd,
-                core,
-                reader: crate::transport::stream::ReaderTarget::Tcp(stream),
-            }) => self
-                .try_enqueue_local_ready(ReadyItem::StartTcpReader(Box::new(TcpReaderStart {
-                    fd,
-                    core,
-                    stream,
-                })))
+            LoopCommand::Io(LoopIoCommand::StartSocketReader { fd, core, reader })
+                if matches!(
+                    reader,
+                    crate::transport::stream::ReaderTarget::Tcp(_)
+                        | crate::transport::stream::ReaderTarget::Unix(_)
+                ) =>
+            {
+                self.try_enqueue_local_ready(ReadyItem::StartSocketReader(Box::new(
+                    SocketReaderStart { fd, core, reader },
+                )))
                 .or_else(|item| self.try_enqueue_active_ready(item))
                 .map_err(|item| match item {
-                    ReadyItem::StartTcpReader(start) => {
-                        let TcpReaderStart { fd, core, stream } = *start;
-                        LoopCommand::Io(LoopIoCommand::StartSocketReader {
-                            fd,
-                            core,
-                            reader: crate::transport::stream::ReaderTarget::Tcp(stream),
-                        })
+                    ReadyItem::StartSocketReader(start) => {
+                        let SocketReaderStart { fd, core, reader } = *start;
+                        LoopCommand::Io(LoopIoCommand::StartSocketReader { fd, core, reader })
                     }
                     _ => unreachable!("local reader enqueue preserves item kind"),
-                }),
+                })
+            }
             LoopCommand::ScheduleReady(callback) => self
                 .try_enqueue_local_ready(ReadyItem::Callback(callback))
                 .or_else(|item| self.try_enqueue_active_ready(item))
@@ -1662,13 +1666,9 @@ impl LoopCore {
                         LoopCommand::Transport(LoopTransportCommand::StreamWrite(core))
                     }
                     #[cfg(unix)]
-                    ReadyItem::StartTcpReader(start) => {
-                        let TcpReaderStart { fd, core, stream } = *start;
-                        LoopCommand::Io(LoopIoCommand::StartSocketReader {
-                            fd,
-                            core,
-                            reader: crate::transport::stream::ReaderTarget::Tcp(stream),
-                        })
+                    ReadyItem::StartSocketReader(start) => {
+                        let SocketReaderStart { fd, core, reader } = *start;
+                        LoopCommand::Io(LoopIoCommand::StartSocketReader { fd, core, reader })
                     }
                     ReadyItem::ProcessTransport(core) => {
                         LoopCommand::Transport(LoopTransportCommand::Process(core))
@@ -2045,7 +2045,7 @@ mod wake_tests {
     fn wait_for_wake_observes_a_signal_that_arrived_before_polling() {
         let wake = Arc::new(LoopWake::new());
         wake.signal();
-        let mut wait = Box::pin(WaitForWake::new(&wake, Duration::from_secs(1)));
+        let mut wait = Box::pin(WaitForWake::new(&wake));
         let task_waker = noop_waker();
         let mut context = Context::from_waker(&task_waker);
 
@@ -2076,7 +2076,14 @@ mod wake_tests {
         let wake = Arc::new(LoopWake::new());
         let started = Instant::now();
 
-        runtime.block_on(WaitForWake::new(&wake, Duration::from_millis(2)));
+        assert!(
+            runtime
+                .block_on_until(
+                    WaitForWake::new(&wake),
+                    Instant::now() + Duration::from_millis(2)
+                )
+                .is_none()
+        );
 
         assert!(!wake.ready_pending.load(Ordering::Acquire));
         assert!(started.elapsed() >= Duration::from_millis(1));

@@ -20,10 +20,11 @@ cargo check
 ```
 
 The nightly pin supplies the allocator API merged in
-[rust-lang/rust#156882](https://github.com/rust-lang/rust/pull/156882). The opt-in
-`scheduler-batch-cache` Cargo feature uses the stabilized `Allocator` and
-`Vec::with_capacity_in` APIs for scheduler batch storage. With it enabled,
-each embedded runtime caches one exact-layout `System` allocation
+[rust-lang/rust#156882](https://github.com/rust-lang/rust/pull/156882).
+Scheduler batch reuse uses the stabilized `Allocator` and
+`Vec::with_capacity_in` APIs in every normal build. The
+`scheduler-batch-cache` feature remains as a compatibility flag.
+Each embedded runtime caches one exact-layout `System` allocation
 between `block_on` calls: normally 2 KiB on 64-bit platforms, with a hard 16 KiB
 retention ceiling. The cache belongs to the runtime's owner thread and needs no
 mutex or reference-counted allocator handles. Simultaneous allocations remain
@@ -39,10 +40,8 @@ that hot structure's layout.
 This replaces the rejected shared, size-class recycler experiment. Ready queues,
 timers, task futures, transport queues, and stream payload pools keep their
 existing allocation strategies. There is no `allocator_ext` feature gate or
-runtime allocator-selection API. Default builds retain ordinary `Vec` allocation
-and draining: the cache improved native scheduler turns but regressed TCP
-workloads, so it is not enabled in production wheels. Kani's older compiler also
-uses ordinary `Vec` for
+runtime allocator-selection API. Default builds now cache scheduler batches; older benchmark results predate
+the wider runtime optimizations. Kani's older compiler uses ordinary `Vec` for
 scheduler proofs; strict-provenance Miri tests exercise the actual allocator.
 
 For an isolated measurement of scheduler entry/exit costs, build
@@ -61,9 +60,8 @@ The runner records binary hashes and randomized paired process order before
 measurement. This benchmark isolates runtime turns; evaluate application
 timing and peak RSS separately.
 
-To evaluate the cache with your own Python workload, build explicitly with
-`uv run --with maturin maturin develop --release --features scheduler-batch-cache`.
-Rebuild without that feature to restore the default path.
+Normal release builds include the cache. Measure application timing and peak
+RSS for your workload; the compatibility feature does not select another path.
 
 Build the extension and install it into the current environment:
 
@@ -105,8 +103,9 @@ released on panic, and task wakeups keep their existing scheduling order. The
 allocation check covers idle turns and 16 continuously ready tasks, with runtime
 and task creation outside the measurement.
 
-General `block_on()` batch allocation remains unchanged; the optional
-`scheduler-batch-cache` feature described above has a separate workload tradeoff.
+General `block_on()` turns also reuse their batch allocation across calls, as
+described above. Root wakers are cached and deadline-bound parking uses the
+driver timeout without allocating a `Sleep` timer entry.
 
 ### Profile-guided wheel builds
 

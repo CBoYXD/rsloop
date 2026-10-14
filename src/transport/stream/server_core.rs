@@ -115,14 +115,15 @@ impl ServerCore {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ServerCore"))]
     #[inline]
     pub(super) fn connection_opened(&self) {
-        self.active_connections.fetch_add(1, Ordering::SeqCst);
+        self.active_connections.fetch_add(1, Ordering::AcqRel);
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ServerCore"))]
     #[inline]
     pub(super) fn connection_lost(&self) {
-        self.active_connections.fetch_sub(1, Ordering::SeqCst);
-        self.closed_notify.notify_all();
+        if self.active_connections.fetch_sub(1, Ordering::AcqRel) == 1 && self.is_closed() {
+            self.closed_notify.notify_all();
+        }
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ServerCore"))]
@@ -449,7 +450,7 @@ pub(super) mod tests {
             assert_eq!(server.active_connections.load(Ordering::SeqCst), 0);
             assert_eq!(
                 connection_notice.try_recv().expect("connection notice"),
-                Some(())
+                None
             );
 
             let mut accept_notice = server.closed_notify.listen();
@@ -464,6 +465,14 @@ pub(super) mod tests {
             assert!(server.is_closed());
             assert!(!server.is_serving());
             assert_eq!(close_notice.try_recv().expect("close notice"), Some(()));
+            server.connection_opened();
+            server.connection_opened();
+            let mut last_connection = server.closed_notify.listen();
+            server.connection_lost();
+            assert_eq!(last_connection.try_recv().unwrap(), None);
+            server.connection_lost();
+            assert_eq!(last_connection.try_recv().unwrap(), Some(()));
+
             server.close();
 
             shutdown_test_server(server, loop_core);

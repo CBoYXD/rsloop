@@ -21,8 +21,8 @@ use crate::vibeio::driver::AnyInterruptor;
 pub(crate) struct RemoteWakeContext {
     pub(crate) queue: Arc<SegQueue<Arc<TaskWake>>>,
     pub(crate) interruptor: AnyInterruptor,
-    pub(crate) waiting: Arc<AtomicBool>,
-    pub(crate) interrupt_pending: Arc<AtomicBool>,
+    pub(crate) waiting: AtomicBool,
+    pub(crate) interrupt_pending: AtomicBool,
 }
 
 /// Only this Send + Sync proxy crosses threads through a Waker.
@@ -146,8 +146,8 @@ mod tests {
         let remote = Arc::new(RemoteWakeContext {
             queue: Arc::new(SegQueue::new()),
             interruptor: driver.get_interruptor(),
-            waiting: Arc::new(AtomicBool::new(false)),
-            interrupt_pending: Arc::new(AtomicBool::new(false)),
+            waiting: AtomicBool::new(false),
+            interrupt_pending: AtomicBool::new(false),
         });
         let mut task = task();
         Arc::get_mut(&mut Rc::get_mut(&mut task).unwrap().wake)

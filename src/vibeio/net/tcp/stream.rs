@@ -383,6 +383,29 @@ impl PollTcpStream {
         })
     }
 
+    /// Register an endpoint whose nonblocking mode the transport established.
+    #[allow(dead_code, reason = "Used by the Python transport embedding")]
+    pub(crate) fn from_shared_nonblocking(
+        inner: std::sync::Arc<std::net::TcpStream>,
+    ) -> Result<Self, io::Error> {
+        #[cfg(unix)]
+        let raw = inner.as_raw_fd();
+        #[cfg(windows)]
+        let raw = crate::vibeio::RawOsHandle::Socket(inner.as_raw_socket());
+        let handle = InnerRawHandle::new_with_mode(
+            raw,
+            Interest::READABLE | Interest::WRITABLE,
+            RegistrationMode::Poll,
+        )?;
+        Ok(Self {
+            stream: TcpStream { inner, handle },
+            read_ready: RefCell::new(false),
+            write_ready: RefCell::new(false),
+            #[cfg(target_os = "linux")]
+            read_drained: false,
+        })
+    }
+
     /// Converts this poll stream into an adaptive `TcpStream`.
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PollTcpStream"))]
     #[inline]
@@ -664,7 +687,8 @@ impl TokioAsyncRead for PollTcpStream {
 
         let this = self.get_mut();
         #[cfg(target_os = "linux")]
-        if std::mem::take(&mut this.read_drained) {
+        if std::mem::take(&mut this.read_drained) && !this.stream.handle.take_unclaimed_readiness()
+        {
             // A short Linux TCP read consumed the currently available data.
             // Register before yielding; new data and FIN both wake this reader.
             // A spurious poll is harmless: the next read handles WouldBlock.

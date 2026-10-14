@@ -1,24 +1,14 @@
 //! Adapter for blocking operations that cannot run on an async reactor thread.
 
-use std::thread;
-
-use futures::channel::oneshot;
-
-/// Runs one blocking closure on a named worker and returns its result
-/// asynchronously.
+/// Run blocking work on the shared pool. Panic isolation retains the previous
+/// dropped-worker error contract without spawning a thread for every call.
 #[cfg_attr(feature = "profile", hotpath::measure(future = true))]
-pub async fn run<T, F>(name: impl Into<String>, task: F) -> Result<T, String>
+pub async fn run<T, F>(_name: impl Into<String>, task: F) -> Result<T, String>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    let (tx, rx) = oneshot::channel();
-    thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            let _ = tx.send(task());
-        })
-        .map_err(|err| err.to_string())?;
-
-    rx.await.map_err(|_| "blocking worker dropped".to_owned())
+    smol::unblock(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)))
+        .await
+        .map_err(|_| "blocking worker dropped".to_owned())
 }

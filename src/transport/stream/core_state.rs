@@ -163,8 +163,7 @@ impl StreamTransportCore {
         hotpath::measure(impl_type = "StreamTransportCore")
     )]
     pub(super) fn is_closing_or_lost(&self) -> bool {
-        let state = self.state.lock().expect("poisoned transport state");
-        state.closing || state.lost_called
+        self.state.flags() & 9 != 0
     }
 
     #[cfg_attr(
@@ -183,7 +182,7 @@ impl StreamTransportCore {
         hotpath::measure(impl_type = "StreamTransportCore")
     )]
     pub(super) fn is_closing(&self) -> bool {
-        self.state.lock().expect("poisoned transport state").closing
+        self.state.flags() & 1 != 0
     }
 
     #[cfg_attr(
@@ -243,8 +242,8 @@ impl StreamTransportCore {
             // The timeout is only a backstop against missed notifications;
             // resume_reading()/set_closing() wake the worker immediately.
             let (guard, _) = self
-                .state_cv
-                .wait_timeout(state, Duration::from_millis(50))
+                .state
+                .wait_timeout(&self.state_cv, state, Duration::from_millis(50))
                 .expect("poisoned transport state");
             state = guard;
         }

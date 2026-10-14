@@ -41,7 +41,7 @@ pub(crate) async fn run_tcp_socket_reader_task(
     core: Arc<StreamTransportCore>,
     stream: Arc<StdTcpStream>,
 ) {
-    let mut reader = match VibePollTcpStream::from_shared(stream) {
+    let mut reader = match VibePollTcpStream::from_shared_nonblocking(stream) {
         Ok(reader) => reader,
         Err(err) => {
             core.enqueue_pending_read_event(PendingReadEvent::ConnectionLost(Some(
@@ -314,9 +314,9 @@ pub(super) async fn run_windows_poll_tcp_reader(
 #[cfg(unix)]
 pub(crate) async fn run_unix_socket_reader_task(
     core: Arc<StreamTransportCore>,
-    stream: StdUnixStream,
+    stream: Arc<StdUnixStream>,
 ) {
-    let mut reader = match VibePollUnixStream::from_std(stream) {
+    let mut reader = match VibePollUnixStream::from_shared_nonblocking(stream) {
         Ok(reader) => reader,
         Err(err) => {
             core.enqueue_pending_read_event(PendingReadEvent::ConnectionLost(Some(

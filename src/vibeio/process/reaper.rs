@@ -2,13 +2,12 @@
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(all(test, unix))]
+use std::task::{Context, Poll, Waker};
 use std::{
     io::{self},
     process::ExitStatus,
-    task::{Context, Poll, Waker},
 };
-
-use futures_util::FutureExt;
 
 use crate::vibeio::current_zombie_reaper;
 
@@ -109,7 +108,7 @@ impl ZombieReaper {
     pub(crate) async fn wait(&self, child: std::process::Child) -> io::Result<ExitStatus> {
         let child = ReapChild(Some(child));
         let (sender, recver) = oneshot::async_channel();
-        if let Some(reaper_send) = current_zombie_reaper().await {
+        if let Some(reaper_send) = current_zombie_reaper() {
             // Send the child to the zombie reaper to wait on it asynchronously.
             if let Err(err) = reaper_send.try_send((child, Some(sender))) {
                 wait_in_background(err.into_inner());
@@ -130,9 +129,7 @@ impl ZombieReaper {
             return;
         }
         let child = ReapChild(Some(child));
-        if let Poll::Ready(Some(reaper_send)) =
-            Box::pin(current_zombie_reaper()).poll_unpin(&mut Context::from_waker(Waker::noop()))
-        {
+        if let Some(reaper_send) = current_zombie_reaper() {
             // Send the child to the zombie reaper, so it can wait on it
             // asynchronously. A rejected message drops its guard
             // and starts fallback reaping.
@@ -544,26 +541,31 @@ async fn zombie_reaper_fn(rx: async_channel::Receiver<ZombieReaperMessage>) {
 #[cfg(target_os = "linux")]
 #[inline]
 fn pidfd_available() -> bool {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        use std::os::fd::{FromRawFd, OwnedFd};
 
-    // Try opening a pidfd for our own PID — it will succeed on 5.3+ and fail
-    // with ENOSYS on older kernels.
-    let pid = std::process::id() as libc::pid_t;
-    // SAFETY: pidfd_open takes the current process's integer PID and zero
-    // flags, with no pointers. A successful result transfers a fresh
-    // descriptor.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
-    if fd >= 0 {
-        // SAFETY: the successful syscall returned a valid, uniquely owned fd.
-        let _pidfd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
-        true
-    } else {
-        let err = io::Error::last_os_error();
-        // ENOSYS → syscall not available; anything else means it *is* available
-        // but the specific call failed for another reason (shouldn't happen for
-        // our own PID, but be safe).
-        err.raw_os_error() != Some(libc::ENOSYS)
-    }
+        // Try opening a pidfd for our own PID — it will succeed on 5.3+ and
+        // fail with ENOSYS on older kernels.
+        let pid = std::process::id() as libc::pid_t;
+        // SAFETY: pidfd_open takes the current process's integer PID and zero
+        // flags, with no pointers. A successful result transfers a fresh
+        // descriptor.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
+        if fd >= 0 {
+            // SAFETY: the successful syscall returned a valid, uniquely owned
+            // fd.
+            let _pidfd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+            true
+        } else {
+            let err = io::Error::last_os_error();
+            // ENOSYS → syscall not available; anything else means it *is*
+            // available but the specific call failed for another
+            // reason (shouldn't happen for our own PID, but be
+            // safe).
+            err.raw_os_error() != Some(libc::ENOSYS)
+        }
+    })
 }
 
 /// Convert a raw `waitpid` status into a `std::process::ExitStatus`.
