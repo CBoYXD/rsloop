@@ -370,6 +370,10 @@ fn arm_wait(py: Python<'_>, operation: Py<SocketOperation>) -> PyResult<()> {
 /// when the service future is cancelled before its first poll.
 struct RequestCleanup(Arc<WakeState>);
 impl Drop for RequestCleanup {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<RequestCleanup as Drop>")
+    )]
     fn drop(&mut self) {
         let pending = self
             .0

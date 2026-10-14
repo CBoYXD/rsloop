@@ -166,8 +166,12 @@ impl StreamTransportCore {
                 ));
             }
             let (guard, _) = self
-                .state_cv
-                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .state
+                .wait_timeout(
+                    &self.state_cv,
+                    state,
+                    deadline.saturating_duration_since(now),
+                )
                 .expect("poisoned transport state");
             state = guard;
         }

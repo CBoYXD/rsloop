@@ -42,6 +42,7 @@ pub(super) struct OwnedReadBuffer {
 }
 
 impl OwnedReadBuffer {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "OwnedReadBuffer"))]
     pub(super) fn is_pooled(&self) -> bool {
         self.pool.is_some()
     }
@@ -235,6 +236,7 @@ impl OwnedWriteBuffer {
         self.bytes.extend_from_slice(data);
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "OwnedWriteBuffer"))]
     /// Materialize Python-backed batches in the transport pool so their
     /// allocation is recycled when the staged write finishes.
     pub(super) fn extend_from_slice_pooled(&mut self, data: &[u8], pool: &Arc<WriteBufferPool>) {

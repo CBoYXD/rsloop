@@ -104,6 +104,7 @@ struct WaitForWake<'a> {
     wake: &'a LoopWake,
 }
 impl<'a> WaitForWake<'a> {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "WaitForWake"))]
     fn new(wake: &'a LoopWake) -> Self {
         Self { wake }
     }
@@ -338,6 +339,10 @@ pub struct LoopState {
 }
 
 impl crate::state_snapshot::SnapshotFlags for LoopState {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<LoopState as crate :: state_snapshot :: SnapshotFlags>")
+    )]
     fn snapshot_flags(&self) -> u8 {
         u8::from(self.running) | (u8::from(self.stopping) << 1) | (u8::from(self.closed) << 2)
     }
@@ -491,6 +496,7 @@ impl LoopCore {
         self.send_remote_command(LoopCommand::ScheduleReadyHandle(handle))
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
     #[inline]
     pub(crate) fn current_turn(&self) -> u64 {
         self.turn_number.load(Ordering::Relaxed)

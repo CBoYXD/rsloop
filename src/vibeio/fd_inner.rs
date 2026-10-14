@@ -86,6 +86,7 @@ impl InnerRawHandle {
         }
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "InnerRawHandle"))]
     #[cfg(target_os = "linux")]
     pub(crate) fn take_unclaimed_readiness(&self) -> bool {
         match self.driver.as_ref() {

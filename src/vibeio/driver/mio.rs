@@ -164,6 +164,7 @@ impl MioDriver {
         }
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "MioDriver"))]
     #[cfg(target_os = "linux")]
     pub(crate) fn take_unclaimed_readiness(&self, token: Token) -> bool {
         self.state
