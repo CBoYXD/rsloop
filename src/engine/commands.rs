@@ -83,6 +83,75 @@ pub struct ServerAcceptStart {
     pub task_guard: ServerAcceptTaskGuard,
 }
 
+/// Off-thread ready items queued for the active run.
+///
+/// The loop thread schedules into its own queue without a lock, so the two
+/// sources only meet when the drain starts the next generation. Each item
+/// here records `LoopCore::local_enqueues` as read when it was queued: it was
+/// scheduled after that many loop-thread enqueues, and the drain merges it
+/// behind exactly those (see `merge_ready_generation`). Marks are stored once
+/// per change, as `(index, mark)` pairs, because a burst of off-thread work
+/// between two loop-thread enqueues shares one.
+pub struct PendingReady<T = ReadyItem> {
+    pub(crate) items: VecDeque<T>,
+    pub(crate) marks: Vec<(usize, u64)>,
+}
+
+impl<T> Default for PendingReady<T> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<PendingReady as Default>")
+    )]
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+            marks: Vec::new(),
+        }
+    }
+}
+
+impl<T> PendingReady<T> {
+    /// Queues `item`, scheduled after `local_mark` loop-thread enqueues.
+    #[inline]
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PendingReady"))]
+    pub(crate) fn push(&mut self, item: T, local_mark: u64) {
+        self.mark(local_mark);
+        self.items.push_back(item);
+    }
+
+    /// Queues `items` in order, all scheduled after `local_mark` loop-thread
+    /// enqueues.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PendingReady"))]
+    pub(crate) fn extend(&mut self, items: impl IntoIterator<Item = T>, local_mark: u64) {
+        let (len, marks) = (self.items.len(), self.marks.len());
+        self.mark(local_mark);
+        self.items.extend(items);
+        if self.items.len() == len {
+            self.marks.truncate(marks);
+        }
+    }
+
+    /// Takes every item out of scheduling order tracking, once the run that
+    /// could merge it with loop-thread work has ended.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PendingReady"))]
+    pub(crate) fn take_items(&mut self) -> VecDeque<T> {
+        self.marks.clear();
+        std::mem::take(&mut self.items)
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PendingReady"))]
+    fn mark(&mut self, local_mark: u64) {
+        if self
+            .marks
+            .last()
+            .is_none_or(|&(_, mark)| mark != local_mark)
+        {
+            self.marks.push((self.items.len(), local_mark));
+        }
+    }
+}
+
 /// Control-plane messages consumed by the dedicated runtime dispatcher.
 pub enum LoopCommand {
     /// Enqueues a callback whose lifetime is shared independently of Python.
@@ -121,7 +190,10 @@ pub enum LoopRunCommand {
     /// Installs the ready queue used by the active loop-thread run.
     EnterRun {
         /// Queue shared between producers and the loop-thread drain.
-        pending_ready: Arc<Mutex<VecDeque<ReadyItem>>>,
+        pending_ready: Arc<Mutex<PendingReady>>,
+        /// `LoopCore::local_enqueues` before the run could enqueue anything:
+        /// work queued before the run goes ahead of all of the run's own.
+        local_mark: u64,
     },
     /// Clears the active run and acknowledges dispatcher cleanup.
     FinishRun {
