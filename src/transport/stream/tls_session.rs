@@ -8,7 +8,7 @@
 //! writer workers share one session without stepping on each other.
 
 use std::{
-    io::{self, Read as _, Write as _},
+    io::{self, BufRead as _, Write as _},
     sync::{Arc, Mutex, Weak},
     thread,
     time::Duration,
@@ -78,11 +78,29 @@ impl TlsConnectionKind {
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TlsConnectionKind"))]
-    pub(super) fn reader_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Client(conn) => conn.reader().read(buf),
-            Self::Server(conn) => conn.reader().read(buf),
+    pub(super) fn reader_drain(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        let mut reader = match self {
+            Self::Client(conn) => conn.reader(),
+            Self::Server(conn) => conn.reader(),
+        };
+        buf.clear();
+        let limit = buf.capacity();
+        debug_assert!(limit > 0);
+        while buf.len() < limit {
+            let chunk = match reader.fill_buf() {
+                Ok([]) => break,
+                Ok(chunk) => chunk,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                // Deliver already copied plaintext before reporting a terminal
+                // error on the next drain, matching Read's partial-read rule.
+                Err(_) if !buf.is_empty() => break,
+                Err(err) => return Err(err),
+            };
+            let take = chunk.len().min(limit - buf.len());
+            buf.extend_from_slice(&chunk[..take]);
+            reader.consume(take);
         }
+        Ok(buf.len())
     }
 
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TlsConnectionKind"))]
@@ -254,19 +272,24 @@ pub(super) fn continue_tls_handshake_read(
 }
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
-pub(super) fn drain_tls_plaintext_locked(
+fn drain_tls_plaintext(
     core: &Arc<StreamTransportCore>,
-    state: &mut TlsIoState,
+    tls_state: &SharedTlsIoState,
     plaintext: &mut Vec<u8>,
 ) -> Result<bool, String> {
     let mut saw_data = false;
     loop {
-        plaintext.resize(plaintext.capacity(), 0);
-        match state.connection.reader_read(plaintext) {
+        // Never wait for a pool slot while holding the shared TLS session:
+        // the writer needs this lock to make progress under read backpressure.
+        let result = tls_state
+            .lock()
+            .expect("poisoned tls state")
+            .connection
+            .reader_drain(plaintext);
+        match result {
             Ok(0) => break,
-            Ok(n) => {
+            Ok(_) => {
                 saw_data = true;
-                plaintext.truncate(n);
                 let data = std::mem::take(plaintext);
                 core.enqueue_pending_read_event(PendingReadEvent::Data(data));
                 let Some(next) =
@@ -289,8 +312,7 @@ pub(super) fn drain_buffered_tls_plaintext(
     tls_state: &SharedTlsIoState,
     plaintext: &mut Vec<u8>,
 ) -> TlsReadOutcome {
-    let mut state = tls_state.lock().expect("poisoned tls state");
-    match drain_tls_plaintext_locked(core, &mut state, plaintext) {
+    match drain_tls_plaintext(core, tls_state, plaintext) {
         Ok(true) => TlsReadOutcome::Continue,
         Ok(false) => TlsReadOutcome::Eof,
         Err(err) => TlsReadOutcome::ConnectionLost(err),
@@ -309,7 +331,8 @@ pub(super) fn read_tls_records(
             if let Err(err) = state.connection.process_new_packets().map_err(tls_io_error) {
                 return TlsReadOutcome::ConnectionLost(err.to_string());
             }
-            match drain_tls_plaintext_locked(core, &mut state, plaintext) {
+            drop(state);
+            match drain_tls_plaintext(core, tls_state, plaintext) {
                 Ok(true) => TlsReadOutcome::Continue,
                 Ok(false) => TlsReadOutcome::Eof,
                 Err(err) => TlsReadOutcome::ConnectionLost(err),
@@ -322,7 +345,8 @@ pub(super) fn read_tls_records(
             if let Err(err) = flush_tls_io_locked(&mut state) {
                 return TlsReadOutcome::ConnectionLost(err.to_string());
             }
-            match drain_tls_plaintext_locked(core, &mut state, plaintext) {
+            drop(state);
+            match drain_tls_plaintext(core, tls_state, plaintext) {
                 Ok(_) => TlsReadOutcome::Continue,
                 Err(err) => TlsReadOutcome::ConnectionLost(err),
             }
@@ -430,7 +454,11 @@ mod tests {
     const CERTFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/cert.pem");
 
     fn client_connection() -> ClientConnection {
-        let cert_data = fs::read(CERTFILE).expect("read certificate fixture");
+        let cafile = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tls/ca-cert.pem"
+        );
+        let cert_data = fs::read(cafile).expect("read CA certificate fixture");
         let certs = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(cert_data)))
             .collect::<Result<Vec<_>, _>>()
             .expect("parse certificate fixture");
@@ -454,6 +482,63 @@ mod tests {
             connection: TlsConnectionKind::Client(client_connection()),
             shutdown_timeout: Duration::from_millis(50),
         }))
+    }
+
+    #[test]
+    fn plaintext_drain_preserves_capacity_boundaries_and_terminal_state() {
+        let mut certs = BufReader::new(Cursor::new(fs::read(CERTFILE).unwrap()));
+        let certs = rustls_pemfile::certs(&mut certs)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let keyfile = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/key.pem");
+        let mut key = BufReader::new(Cursor::new(fs::read(keyfile).unwrap()));
+        let key = rustls_pemfile::private_key(&mut key).unwrap().unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let mut server = ServerConnection::new(Arc::new(config)).unwrap();
+        let mut client = client_connection();
+        for _ in 0..10 {
+            let mut records = Vec::new();
+            client.write_tls(&mut records).unwrap();
+            server.read_tls(&mut Cursor::new(records)).unwrap();
+            server.process_new_packets().unwrap();
+            let mut records = Vec::new();
+            server.write_tls(&mut records).unwrap();
+            client.read_tls(&mut Cursor::new(records)).unwrap();
+            client.process_new_packets().unwrap();
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        server.writer().write_all(b"hello world").unwrap();
+        server.send_close_notify();
+        let mut records = Vec::new();
+        server.write_tls(&mut records).unwrap();
+        client.read_tls(&mut Cursor::new(records)).unwrap();
+        client.process_new_packets().unwrap();
+        let mut connection = TlsConnectionKind::Client(client);
+        let mut plaintext = Vec::with_capacity(4);
+        let capacity = plaintext.capacity();
+        let mut result = Vec::new();
+        loop {
+            let count = connection.reader_drain(&mut plaintext).unwrap();
+            assert!(count <= capacity);
+            assert_eq!(plaintext.capacity(), capacity);
+            if count == 0 {
+                break;
+            }
+            result.extend_from_slice(&plaintext);
+        }
+        assert_eq!(result, b"hello world");
+        assert!(plaintext.is_empty());
+
+        let mut connection = TlsConnectionKind::Client(client_connection());
+        plaintext.extend_from_slice(b"old");
+        assert_eq!(connection.reader_drain(&mut plaintext).unwrap(), 0);
+        assert!(plaintext.is_empty());
     }
 
     #[test]

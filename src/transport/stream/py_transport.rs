@@ -24,10 +24,11 @@ use super::{
 impl PyStreamTransport {
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PyStreamTransport"))]
     pub(crate) fn write_data(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        if self.core.is_closing() {
+        let (closing, writable, backpressure_active) = self.core.write_status();
+        if closing {
             return Ok(());
         }
-        if !self.core.is_writable() {
+        if !writable {
             return Err(PyRuntimeError::new_err("transport is not writable"));
         }
 
@@ -45,7 +46,7 @@ impl PyStreamTransport {
             }
         } else if let Ok(bytes) = data.cast::<PyBytes>() {
             self.core
-                .try_write_bytes(bytes)
+                .try_write_bytes_with_status(bytes, backpressure_active)
                 .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
             return Ok(());
         } else {
@@ -74,10 +75,11 @@ impl PyStreamTransport {
             }
             return Ok(());
         }
-        if self.core.is_closing() {
+        let (closing, writable, _) = self.core.write_status();
+        if closing {
             return Ok(());
         }
-        if !self.core.is_writable() {
+        if !writable {
             return Err(PyRuntimeError::new_err("transport is not writable"));
         }
 

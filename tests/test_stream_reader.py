@@ -327,6 +327,46 @@ class TestFastStreamReaderCompat:
 
         rsloop.run(main())
 
+    @pytest.mark.parametrize("method", ["read", "readexactly", "readuntil", "readline"])
+    def test_retained_immediate_reads_keep_independent_results(self, method):
+        async def main():
+            reader = PyFastStreamReader(64, asyncio.get_running_loop())
+
+            def read():
+                if method in {"read", "readexactly"}:
+                    return getattr(reader, method)(2)
+                return getattr(reader, method)()
+
+            reader.feed_data(b"a\nb\n")
+            first = read()
+            second = read()
+            assert first is not second
+            assert await second == b"b\n"
+            assert await first == b"a\n"
+            # Keeping an exhausted awaitable must not expose a later result.
+            reader.feed_data(b"c\n")
+            third = read()
+            assert await first is None
+            assert await third == b"c\n"
+
+        rsloop.run(main())
+
+    def test_cancelled_exact_read_restores_partial_before_immediate_feed(self):
+        async def main():
+            reader = PyFastStreamReader(64, asyncio.get_running_loop())
+            pending = reader.readexactly(8)
+            reader.feed_data(b"abcd")
+            pending.cancel()
+            # The deferred cancellation callback has not run yet.
+            reader.feed_data(b"efgh")
+            assert await reader.readexactly(8) == b"abcdefgh"
+            replacement = reader.readexactly(4)
+            await asyncio.sleep(0)
+            reader.feed_data(b"next")
+            assert await replacement == b"next"
+
+        rsloop.run(main())
+
     def _run_case(self, limit, script, call):
         results = {}
 

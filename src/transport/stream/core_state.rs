@@ -308,17 +308,6 @@ impl StreamTransportCore {
         feature = "profile",
         hotpath::measure(impl_type = "StreamTransportCore")
     )]
-    pub(super) fn is_writable(&self) -> bool {
-        self.state
-            .lock()
-            .expect("poisoned transport state")
-            .writable
-    }
-
-    #[cfg_attr(
-        feature = "profile",
-        hotpath::measure(impl_type = "StreamTransportCore")
-    )]
     pub(super) fn get_write_buffer_size(&self) -> usize {
         self.state
             .lock()

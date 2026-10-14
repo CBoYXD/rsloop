@@ -231,6 +231,20 @@ impl OwnedWriteBuffer {
         self.bytes.extend_from_slice(data);
     }
 
+    /// Materialize Python-backed batches in the transport pool so their
+    /// allocation is recycled when the staged write finishes.
+    pub(super) fn extend_from_slice_pooled(&mut self, data: &[u8], pool: &Arc<WriteBufferPool>) {
+        if let Some(bytes) = self.python_bytes.take() {
+            let needed = bytes.len() - self.offset + data.len();
+            let (allocated, pooled) = pool.acquire(needed);
+            self.bytes = allocated;
+            self.pool = pooled.then(|| Arc::clone(pool));
+            self.bytes.extend_from_slice(&bytes[self.offset..]);
+            self.offset = 0;
+        }
+        self.bytes.extend_from_slice(data);
+    }
+
     #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "OwnedWriteBuffer"))]
     pub(super) fn try_append(&mut self, data: &[u8]) -> bool {
         if !can_append(self.offset, self.len(), data.len()) {
@@ -823,6 +837,26 @@ mod tests {
             assert!(buffer.try_append(b"third"));
             assert_eq!(buffer.remaining(), b"firstsecondthird");
         });
+    }
+
+    #[test]
+    fn python_coalescing_recycles_pool_storage_and_keeps_unsent_suffix() {
+        use pyo3::{Python, types::PyBytes};
+        crate::initialize_python_for_tests();
+        let pool = Arc::new(WriteBufferPool::new());
+        Python::attach(|py| {
+            for _ in 0..3 {
+                let data = PyBytes::new(py, b"sent-first");
+                let mut buffer = OwnedWriteBuffer::from_python(&data);
+                buffer.advance(5);
+                buffer.extend_from_slice_pooled(b"second", &pool);
+                assert_eq!(buffer.remaining(), b"firstsecond");
+                assert!(buffer.pool.is_some());
+                drop(buffer);
+            }
+        });
+        assert_eq!(pool.allocations.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.state.lock().unwrap().buffers.len(), 1);
     }
 
     #[test]

@@ -1201,9 +1201,14 @@ impl ExactReadAccumulator {
         hotpath::measure(impl_type = "ExactReadAccumulator")
     )]
     fn fill_from(&mut self, buffer: &mut ReadBuffer) {
-        let amount = exact_fill_amount(buffer.len(), self.filled, self.expected);
+        let amount = self.fill_from_slice(buffer.unread());
+        buffer.consume(amount);
+    }
+
+    fn fill_from_slice(&mut self, data: &[u8]) -> usize {
+        let amount = exact_fill_amount(data.len(), self.filled, self.expected);
         if amount == 0 {
-            return;
+            return 0;
         }
         // SAFETY: `value` has exactly `expected` bytes, remains private to
         // this accumulator, and the destination range is disjoint/in-bounds.
@@ -1211,10 +1216,10 @@ impl ExactReadAccumulator {
             let destination = ffi::PyBytes_AsString(self.value.as_ptr())
                 .cast::<u8>()
                 .add(self.filled);
-            core::ptr::copy_nonoverlapping(buffer.unread().as_ptr(), destination, amount);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), destination, amount);
         }
         self.filled += amount;
-        buffer.consume(amount);
+        amount
     }
 
     #[cfg_attr(
@@ -1248,6 +1253,9 @@ pub struct PyFastStreamReader {
     paused: bool,
     eof: bool,
     exception: Option<Py<PyAny>>,
+    waiter_done_cb: Option<Py<PyAny>>,
+    #[cfg(not(Py_GIL_DISABLED))]
+    cached_immediate: Option<Py<PyImmediateRead>>,
 }
 
 /// A weak reader reference avoids a reader -> Future -> callback -> reader
@@ -1294,12 +1302,17 @@ impl PyFastStreamReader {
             .is_some_and(|waiter| waiter.future.bind(py).is(future.bind(py)))
         {
             let reader = slf.into_pyobject(py)?;
-            let callback = Py::new(
-                py,
-                PyReadWaiterDone {
-                    reader: PyWeakrefReference::new(&reader)?.unbind(),
-                },
-            )?;
+            let callback = match &reader.borrow().waiter_done_cb {
+                Some(callback) => callback.clone_ref(py),
+                None => Py::new(
+                    py,
+                    PyReadWaiterDone {
+                        reader: PyWeakrefReference::new(&reader)?.unbind(),
+                    },
+                )?
+                .into_any(),
+            };
+            reader.borrow_mut().waiter_done_cb = Some(callback.clone_ref(py));
             future.call_method1(py, "add_done_callback", (callback,))?;
         }
         Ok(future)
@@ -1402,6 +1415,9 @@ impl PyFastStreamReader {
             paused: false,
             eof: false,
             exception: None,
+            waiter_done_cb: None,
+            #[cfg(not(Py_GIL_DISABLED))]
+            cached_immediate: None,
         })
     }
 
@@ -1418,8 +1434,26 @@ impl PyFastStreamReader {
         feature = "profile",
         hotpath::measure(impl_type = "PyFastStreamReader")
     )]
-    fn ready_result_awaitable(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(Py::new(py, PyImmediateRead { value: Some(value) })?.into_any())
+    fn ready_result_awaitable(&mut self, py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        // Refcounts prove exclusive ownership only while the GIL is held.
+        // Retained or unconsumed awaitables must keep their independent value.
+        #[cfg(not(Py_GIL_DISABLED))]
+        if let Some(cached) = &self.cached_immediate {
+            // SAFETY: `py` holds the GIL and the cache owns this reference.
+            if unsafe { ffi::Py_REFCNT(cached.as_ptr()) } == 1 {
+                let mut immediate = cached.borrow_mut(py);
+                if immediate.value.is_none() {
+                    immediate.value = Some(value);
+                    return Ok(cached.clone_ref(py).into_any());
+                }
+            }
+        }
+        let fresh = Py::new(py, PyImmediateRead { value: Some(value) })?;
+        #[cfg(not(Py_GIL_DISABLED))]
+        {
+            self.cached_immediate = Some(fresh.clone_ref(py));
+        }
+        Ok(fresh.into_any())
     }
 
     #[cfg_attr(
@@ -1681,6 +1715,23 @@ impl PyFastStreamReader {
         self.maybe_resume_transport(py)
     }
 
+    /// Complete a waiting exact read directly from incoming bytes. Reconcile
+    /// cancellation first, restoring its partial data before any new
+    /// consumption.
+    fn fill_exact_from_incoming(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<usize> {
+        self.clear_cancelled_waiter(py)?;
+        if self.exception.is_none()
+            && self.buffer.is_empty()
+            && let Some(exact) = self
+                .waiter
+                .as_mut()
+                .and_then(|waiter| waiter.exact.as_mut())
+        {
+            return Ok(exact.fill_from_slice(data));
+        }
+        Ok(0)
+    }
+
     #[cfg_attr(
         feature = "profile",
         hotpath::measure(impl_type = "PyFastStreamReader")
@@ -1689,7 +1740,8 @@ impl PyFastStreamReader {
         if self.eof {
             return Err(PyValueError::new_err("feed_data after feed_eof"));
         }
-        self.buffer.extend(data);
+        let consumed = self.fill_exact_from_incoming(py, data)?;
+        self.buffer.extend(&data[consumed..]);
         self.maybe_complete_waiter(py)?;
         self.maybe_pause_transport(py)
     }
@@ -1708,7 +1760,12 @@ impl PyFastStreamReader {
         if self.eof {
             return Err(PyValueError::new_err("feed_data after feed_eof"));
         }
-        let _recycled = self.buffer.extend_owned(data);
+        let consumed = self.fill_exact_from_incoming(py, &data)?;
+        if consumed == 0 {
+            let _recycled = self.buffer.extend_owned(data);
+        } else {
+            self.buffer.extend(&data[consumed..]);
+        }
         self.maybe_complete_waiter(py)?;
         self.maybe_pause_transport(py)
     }

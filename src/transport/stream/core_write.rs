@@ -23,7 +23,7 @@ use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyBytes};
 use super::tuning::SERVER_POLL_READER_WRITE_THRESHOLD;
 use super::{
     PendingReadEvent, StreamTransportCore, TransportSpawnContext, WriterCommand,
-    buffers::OwnedWriteBuffer,
+    buffers::{OwnedWriteBuffer, WriteBufferPool},
     io_targets::{StreamKind, TaskedDirectWriter},
     stats::{TRANSPORT_DIRECT_WRITE_ATTEMPTS, TRANSPORT_STAGED_WRITES, transport_stats_enabled},
     stop_socket_reader, tcp_stream_from_owned_socket_fd,
@@ -47,9 +47,13 @@ fn is_write_batch_candidate(len: usize) -> bool {
 }
 
 #[cfg_attr(feature = "profile", hotpath::measure)]
-fn stage_owned_buffer(pending: &mut Option<OwnedWriteBuffer>, data: OwnedWriteBuffer) {
+fn stage_owned_buffer(
+    pending: &mut Option<OwnedWriteBuffer>,
+    data: OwnedWriteBuffer,
+    pool: &Arc<WriteBufferPool>,
+) {
     if let Some(buffer) = pending {
-        buffer.extend_from_slice(data.remaining());
+        buffer.extend_from_slice_pooled(data.remaining(), pool);
     } else {
         *pending = Some(data);
     }
@@ -276,6 +280,7 @@ impl StreamTransportCore {
                 .lock()
                 .expect("poisoned pending direct write"),
             data,
+            &self.write_buffer_pool,
         );
         self.finish_staged_write(should_pause);
         Ok(())
@@ -394,7 +399,24 @@ impl StreamTransportCore {
         feature = "profile",
         hotpath::measure(impl_type = "StreamTransportCore")
     )]
+    pub(super) fn write_status(&self) -> (bool, bool, bool) {
+        let state = self.state.lock().expect("poisoned transport state");
+        (state.closing, state.writable, state.writer_registered)
+    }
+
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "StreamTransportCore")
+    )]
     pub(super) fn try_write_bytes(self: &Arc<Self>, bytes: &Bound<'_, PyBytes>) -> io::Result<()> {
+        self.try_write_bytes_with_status(bytes, self.write_backpressure_active())
+    }
+
+    pub(super) fn try_write_bytes_with_status(
+        self: &Arc<Self>,
+        bytes: &Bound<'_, PyBytes>,
+        backpressure_active: bool,
+    ) -> io::Result<()> {
         let data = bytes.as_bytes();
         #[cfg(windows)]
         if self.direct_writer.is_some()
@@ -411,7 +433,7 @@ impl StreamTransportCore {
             }
         }
 
-        if self.direct_writer.is_some() && !self.write_backpressure_active() {
+        if self.direct_writer.is_some() && !backpressure_active {
             if self.direct_write_scheduled.load(Ordering::Acquire)
                 || (self.coalesce_small_writes && is_write_batch_candidate(data.len()))
             {
@@ -984,16 +1006,17 @@ mod tests {
 
     #[test]
     fn owned_staging_moves_first_allocation_and_appends_only_unsent_bytes() {
+        let pool = std::sync::Arc::new(super::WriteBufferPool::new());
         let mut first = OwnedWriteBuffer::from_slice(b"sent-first");
         first.advance(5);
         let address = first.remaining().as_ptr();
         let mut pending = None;
-        stage_owned_buffer(&mut pending, first);
+        stage_owned_buffer(&mut pending, first, &pool);
         assert_eq!(pending.as_ref().unwrap().remaining().as_ptr(), address);
         assert_eq!(pending.as_ref().unwrap().remaining(), b"first");
         let mut second = OwnedWriteBuffer::from_slice(b"sent-second");
         second.advance(5);
-        stage_owned_buffer(&mut pending, second);
+        stage_owned_buffer(&mut pending, second, &pool);
         assert_eq!(pending.as_ref().unwrap().remaining(), b"firstsecond");
     }
 

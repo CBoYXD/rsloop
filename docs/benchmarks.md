@@ -120,3 +120,77 @@ PYTHON_GIL=0 taskset -c 2 target/bench-free-threaded/bin/python benches/compare_
   --tcp-roundtrips 20000 --payload-size 1024 \
   --json-output target/event-loops-43f624a-free-threaded.json
 ```
+
+
+## Stream optimizations from ANALYSIS.md
+
+Measured October 14, 2026 against baseline commit `c9aa601`, using release
+builds of rsloop 0.1.64, CPython 3.14.7 with the GIL enabled, and Linux
+7.0.0-38-generic x86_64. Both versions ran on CPU 2. Values below are medians
+of seven measured runs; throughput changes are `before / after - 1`.
+
+The implementation recycles materialized Python-backed write batches through
+`WriteBufferPool`, reads closing/writable/backpressure state under one lock on
+the immutable-bytes write path, caches the weak read-waiter callback, and
+reuses consumed immediate-read awaitables when the reader owns their sole
+reference. Awaitable reuse is enabled only on GIL builds. Waiting exact reads
+copy incoming bytes directly into the private Python bytes accumulator after
+reconciling cancellation; trailing data remains available for the next read.
+TLS plaintext is copied through rustls `BufRead` without zero-filling the
+buffer, and the shared TLS session lock is released before waiting for a read
+pool slot.
+
+Buffered and waiting read lifecycle benchmark (nanoseconds per round, lower
+is better). Each method has a 1,000-round warmup and 100,000 measured rounds
+per run. Waiting reads include dispatch of completion callbacks.
+
+| Workload | Before (ns) | After (ns) | Throughput change |
+|---|---:|---:|---:|
+| Buffered `read` | 316.4 | 290.0 | +9.1% |
+| Buffered `readexactly` | 319.2 | 292.0 | +9.3% |
+| Buffered `readuntil` | 346.2 | 323.2 | +7.1% |
+| Waiting `read` | 2,407.9 | 2,389.7 | +0.8% |
+| Waiting `readexactly` | 1,543.0 | 1,500.0 | +2.9% |
+| Waiting `readuntil` | 1,603.0 | 1,514.7 | +5.8% |
+
+Network workload matrix: two warmups, seven measured runs, 16 concurrent
+connections, and 500 operations per connection (8,000 operations per run).
+HTTP uses 4,096-byte bodies; WebSocket frames cycle through 32, 256, and
+4,096 bytes. Timings include connection setup and teardown.
+
+| Workload | Before (ms) | After (ms) | Throughput change |
+|---|---:|---:|---:|
+| HTTP keep-alive | 147.36 | 144.55 | +2.0% |
+| TLS HTTP | 374.43 | 355.25 | +5.4% |
+| Raw WebSocket | 1,592.68 | 1,599.06 | -0.4% |
+| Raw TLS WebSocket | 1,882.32 | 1,862.54 | +1.1% |
+
+These are local shared-host measurements of the combined changes, without
+isolation of each optimization. Some runs overlapped build/test activity on
+the host. Small changes, especially the WebSocket results, should be treated
+as noise: plain WebSocket ranges overlap (1,575.9–1,601.4 ms before versus
+1,591.5–1,637.6 ms after). TLS HTTP ranged from 371.9–379.4 ms before and
+352.4–363.6 ms after. The analysis's predicted 15–25% TLS gain was not observed
+in this workload.
+
+Validation: 358 Python stream/TLS tests and 84 Rust stream tests passed,
+including regressions for retained awaitables, cancellation before its deferred
+callback, pooled write reuse, and TLS drain boundaries/close-notify. Clippy
+passed with warnings denied.
+
+Reproduce each version from its repository root, changing `before` to `after`
+for the modified build:
+
+```bash
+VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop --release --locked
+taskset -c 2 .venv/bin/python benches/stream_read_lifecycle.py \
+  --rounds 100000 --repeat 7 --output target/analysis-before-reads.json
+taskset -c 2 .venv/bin/python benches/workload_matrix.py \
+  --loops rsloop \
+  --scenarios http_keepalive,tls_http,websocket_messages,websocket_tls \
+  --concurrency 16 --requests-per-connection 500 --warmups 2 --repeat 7 \
+  --json-output target/analysis-before-network.json
+```
+
+Raw measurements from this session are saved in
+`target/analysis-{before,after}-{reads,network}.json` (local build artifacts).
