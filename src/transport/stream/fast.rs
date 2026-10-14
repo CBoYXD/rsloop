@@ -1209,6 +1209,10 @@ impl ExactReadAccumulator {
         buffer.consume(amount);
     }
 
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "ExactReadAccumulator")
+    )]
     fn fill_from_slice(&mut self, data: &[u8]) -> usize {
         let amount = exact_fill_amount(data.len(), self.filled, self.expected);
         if amount == 0 {
@@ -1721,6 +1725,10 @@ impl PyFastStreamReader {
         self.maybe_resume_transport(py)
     }
 
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "PyFastStreamReader")
+    )]
     /// Complete a waiting exact read directly from incoming bytes. Reconcile
     /// cancellation first, restoring its partial data before any new
     /// consumption.

@@ -150,6 +150,12 @@ struct StreamTransportState {
 }
 
 impl crate::state_snapshot::SnapshotFlags for StreamTransportState {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(
+            impl_type = "<StreamTransportState as crate :: state_snapshot :: SnapshotFlags>"
+        )
+    )]
     fn snapshot_flags(&self) -> u8 {
         u8::from(self.closing)
             | (u8::from(self.writable) << 1)

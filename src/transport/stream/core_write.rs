@@ -409,6 +409,10 @@ impl StreamTransportCore {
         self.try_write_bytes_with_status(bytes, self.write_backpressure_active())
     }
 
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "StreamTransportCore")
+    )]
     /// Learn whether this connection emits batches. The first isolated write
     /// stays direct; a repeated write stages the tail and predicts batching on
     /// the next turn, so recurring header/body pairs still coalesce together.
@@ -425,6 +429,10 @@ impl StreamTransportCore {
         }
     }
 
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "StreamTransportCore")
+    )]
     pub(super) fn try_write_bytes_with_status(
         self: &Arc<Self>,
         bytes: &Bound<'_, PyBytes>,

@@ -49,12 +49,24 @@ impl DefaultBlockingThreadPool {
 // Wrapping it in another closure would allocate a second Job box.
 struct PooledJob(Box<dyn FnOnce() + Send + 'static>);
 impl rusty_pool::Task<()> for PooledJob {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<PooledJob as rusty_pool :: Task < () >>")
+    )]
     fn run(self) {
         (self.0)();
     }
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<PooledJob as rusty_pool :: Task < () >>")
+    )]
     fn into_fn(self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
         Some(self.0)
     }
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<PooledJob as rusty_pool :: Task < () >>")
+    )]
     fn is_fn(&self) -> bool {
         true
     }

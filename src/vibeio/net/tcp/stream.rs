@@ -383,6 +383,7 @@ impl PollTcpStream {
         })
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PollTcpStream"))]
     /// Register an endpoint whose nonblocking mode the transport established.
     #[allow(dead_code, reason = "Used by the Python transport embedding")]
     pub(crate) fn from_shared_nonblocking(

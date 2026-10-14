@@ -53,6 +53,10 @@ struct CallbackResult<'py> {
     _python: std::marker::PhantomData<Python<'py>>,
 }
 impl Drop for CallbackResult<'_> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<CallbackResult as Drop>")
+    )]
     fn drop(&mut self) {
         // SAFETY: this owns a nonnull result reference; the Python lifetime
         // prevents moving its destruction outside the attached invocation.
@@ -248,6 +252,7 @@ impl<const SOURCE_WORDS: usize> ReadyCallback<SOURCE_WORDS> {
         self.invoke_with(py, |ready| ready.invoke_direct(py))
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ReadyCallback"))]
     /// Invoke a scheduled callback and release its result after context exit.
     pub fn invoke_discard(&self, py: Python<'_>) -> PyResult<()> {
         let result = self.invoke_with(py, |ready| ready.invoke_direct_raw(py))?;
@@ -255,6 +260,7 @@ impl<const SOURCE_WORDS: usize> ReadyCallback<SOURCE_WORDS> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ReadyCallback"))]
     fn invoke_with<R>(&self, py: Python<'_>, call: impl Fn(&Self) -> PyResult<R>) -> PyResult<R> {
         if !self.context_needs_run {
             return call(self);
@@ -291,6 +297,7 @@ impl<const SOURCE_WORDS: usize> ReadyCallback<SOURCE_WORDS> {
         }
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ReadyCallback"))]
     fn invoke_direct_raw<'py>(&self, py: Python<'py>) -> PyResult<CallbackResult<'py>> {
         // SAFETY: the callback and stored arguments remain owned by self. The
         // inline arrays and tuple are valid for the synchronous call, which

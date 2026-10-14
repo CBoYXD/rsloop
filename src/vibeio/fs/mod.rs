@@ -199,31 +199,55 @@ pub trait IntoFileBytes {
     fn into_file_bytes(self) -> Vec<u8>;
 }
 impl IntoFileBytes for Vec<u8> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<Vec as IntoFileBytes>")
+    )]
     fn into_file_bytes(self) -> Vec<u8> {
         self
     }
 }
 impl IntoFileBytes for String {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<String as IntoFileBytes>")
+    )]
     fn into_file_bytes(self) -> Vec<u8> {
         self.into_bytes()
     }
 }
 impl IntoFileBytes for Box<[u8]> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<Box as IntoFileBytes>")
+    )]
     fn into_file_bytes(self) -> Vec<u8> {
         self.into_vec()
     }
 }
 impl<T: AsRef<[u8]> + ?Sized> IntoFileBytes for &T {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<& T as IntoFileBytes>")
+    )]
     fn into_file_bytes(self) -> Vec<u8> {
         self.as_ref().to_vec()
     }
 }
 impl<const N: usize> IntoFileBytes for [u8; N] {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<[u8 ; N] as IntoFileBytes>")
+    )]
     fn into_file_bytes(self) -> Vec<u8> {
         Vec::from(self)
     }
 }
 impl<'a> IntoFileBytes for std::borrow::Cow<'a, [u8]> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<Cow as IntoFileBytes>")
+    )]
     fn into_file_bytes(self) -> Vec<u8> {
         self.into_owned()
     }

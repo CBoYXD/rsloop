@@ -242,6 +242,7 @@ impl UnixStream {
         Self::from_shared_with_mode(std::sync::Arc::new(inner), mode)
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "UnixStream"))]
     fn from_shared_with_mode(
         inner: std::sync::Arc<StdUnixStream>,
         mode: RegistrationMode,
@@ -303,6 +304,7 @@ impl PollUnixStream {
         })
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PollUnixStream"))]
     /// Register a reader sharing the transport's socket allocation.
     pub fn from_shared(inner: std::sync::Arc<StdUnixStream>) -> Result<Self, io::Error> {
         Ok(Self {
@@ -312,6 +314,7 @@ impl PollUnixStream {
         })
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "PollUnixStream"))]
     /// Register an endpoint whose nonblocking mode the transport established.
     #[allow(dead_code, reason = "Used by the Python transport embedding")]
     pub(crate) fn from_shared_nonblocking(

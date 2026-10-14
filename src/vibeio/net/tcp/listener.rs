@@ -102,6 +102,7 @@ impl TcpListener {
         }
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "TcpListener"))]
     /// Cached address family for accepted socket handoffs.
     pub fn is_ipv6(&self) -> bool {
         self.ipv6

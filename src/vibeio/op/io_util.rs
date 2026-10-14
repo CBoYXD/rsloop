@@ -88,6 +88,7 @@ pub(super) struct NativeIoVecs {
 }
 
 impl NativeIoVecs {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "NativeIoVecs"))]
     pub(super) fn new(bufs: &[crate::vibeio::io::IoVec]) -> io::Result<Self> {
         #[cfg(unix)]
         let empty = libc::iovec {
@@ -128,10 +129,12 @@ impl NativeIoVecs {
         Ok(storage)
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "NativeIoVecs"))]
     pub(super) fn len(&self) -> usize {
         self.len
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "NativeIoVecs"))]
     pub(super) fn as_mut_ptr(&mut self) -> *mut NativeIoVec {
         if self.len <= 16 {
             self.inline.as_mut_ptr()

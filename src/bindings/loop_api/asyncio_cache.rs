@@ -39,6 +39,7 @@ cached_function!(
 );
 cached_function!(future_done_stop_fn, "rsloop._loop", "future_done_stop");
 
+#[cfg_attr(feature = "profile", hotpath::measure)]
 #[pyfunction]
 fn loop_reference_gone(_reference: &Bound<'_, PyAny>) {}
 
@@ -49,6 +50,7 @@ struct LoopBoundCallback {
 }
 #[pymethods]
 impl LoopBoundCallback {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopBoundCallback"))]
     fn __call__(&self, py: Python<'_>, arg: &Bound<'_, PyAny>) -> PyResult<()> {
         use pyo3::types::PyWeakrefMethods;
         if let Some(loop_obj) = self.loop_ref.bind(py).upgrade() {
@@ -58,6 +60,7 @@ impl LoopBoundCallback {
     }
 }
 
+#[cfg_attr(feature = "profile", hotpath::measure)]
 pub(super) fn loop_bound_callback(
     py: Python<'_>,
     core: &crate::engine::LoopCore,
@@ -108,6 +111,7 @@ pub(super) fn loop_bound_callback(
     Ok(callbacks[index].clone_ref(py))
 }
 
+#[cfg_attr(feature = "profile", hotpath::measure)]
 pub(super) fn ensure_future<'py>(
     py: Python<'py>,
     future: &Py<PyAny>,

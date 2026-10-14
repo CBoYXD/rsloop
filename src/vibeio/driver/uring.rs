@@ -242,6 +242,7 @@ impl UringDriver {
         }
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "UringDriver"))]
     #[cfg(target_os = "linux")]
     pub(crate) fn take_unclaimed_readiness(&self, token: Token) -> bool {
         if let Some(HandleRegistration::Poll(registration)) =

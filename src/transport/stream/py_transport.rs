@@ -28,16 +28,28 @@ struct InlineWriteSegments<'py> {
     len: usize,
 }
 impl<'py> InlineWriteSegments<'py> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "InlineWriteSegments")
+    )]
     fn new() -> Self {
         Self {
             items: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
             len: 0,
         }
     }
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "InlineWriteSegments")
+    )]
     fn push(&mut self, value: Bound<'py, PyBytes>) {
         self.items[self.len].write(value);
         self.len += 1;
     }
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "InlineWriteSegments")
+    )]
     fn as_slice(&self) -> &[Bound<'py, PyBytes>] {
         // SAFETY: push initializes each prefix element before increasing len;
         // MaybeUninit<T> has T's layout, and this immutable borrow retains it.
@@ -45,6 +57,10 @@ impl<'py> InlineWriteSegments<'py> {
     }
 }
 impl Drop for InlineWriteSegments<'_> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<InlineWriteSegments as Drop>")
+    )]
     fn drop(&mut self) {
         for item in &mut self.items[..self.len] {
             // SAFETY: exactly the initialized prefix contains owned values.

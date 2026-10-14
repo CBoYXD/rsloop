@@ -889,6 +889,7 @@ impl Runtime {
         self.drive(future, Some(deadline))
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "Runtime"))]
     fn drive<T>(
         &self,
         future: impl Future<Output = T>,

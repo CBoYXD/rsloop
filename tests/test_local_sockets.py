@@ -291,7 +291,7 @@ def test_loop_close_releases_socket_wait_cancelled_before_native_poll():
     loop = rsloop.new_event_loop()
     reference = weakref.ref(receiver)
     try:
-        future = loop.sock_recv(receiver, 1)
+        future = cast(asyncio.Future[bytes], loop.sock_recv(receiver, 1))
         # Start the service, then end the run before it needs a readiness event.
         loop.call_soon(loop.stop)
         loop.run_forever()

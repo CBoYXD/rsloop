@@ -29,6 +29,7 @@ struct ConnectDone {
 }
 #[pymethods]
 impl ConnectDone {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ConnectDone"))]
     fn __call__(&self, _future: &Bound<'_, PyAny>) {
         self.wake.done.store(true, Ordering::Release);
         self.wake.waker.wake();
@@ -39,6 +40,7 @@ impl ConnectDone {
         }
         Ok(())
     }
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "ConnectDone"))]
     fn __clear__(&mut self) {
         self.socket = None;
         self.wake.done.store(true, Ordering::Release);
@@ -46,6 +48,7 @@ impl ConnectDone {
     }
 }
 
+#[cfg_attr(feature = "profile", hotpath::measure)]
 /// Keep the original socket alive and wake the native wait on cancellation.
 pub(crate) fn connect_wait_state(
     py: Python<'_>,

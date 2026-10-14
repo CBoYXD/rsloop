@@ -24,6 +24,7 @@ pub struct SnapshotGuard<'a, T: SnapshotFlags> {
 }
 
 impl<T: SnapshotFlags> SnapshotMutex<T> {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "SnapshotMutex"))]
     pub fn new(value: T) -> Self {
         Self {
             flags: AtomicU8::new(value.snapshot_flags()),
@@ -31,11 +32,13 @@ impl<T: SnapshotFlags> SnapshotMutex<T> {
         }
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "SnapshotMutex"))]
     #[inline]
     pub fn flags(&self) -> u8 {
         self.flags.load(Ordering::Acquire)
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "SnapshotMutex"))]
     pub fn lock(&self) -> LockResult<SnapshotGuard<'_, T>> {
         self.inner
             .lock()
@@ -43,6 +46,7 @@ impl<T: SnapshotFlags> SnapshotMutex<T> {
             .map_err(|error| PoisonError::new(self.wrap(error.into_inner())))
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "SnapshotMutex"))]
     fn wrap<'a>(&'a self, guard: MutexGuard<'a, T>) -> SnapshotGuard<'a, T> {
         SnapshotGuard {
             owner: self,
@@ -51,6 +55,7 @@ impl<T: SnapshotFlags> SnapshotMutex<T> {
         }
     }
 
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "SnapshotMutex"))]
     pub fn wait_timeout<'a>(
         &'a self,
         cv: &Condvar,
@@ -74,6 +79,7 @@ impl<T: SnapshotFlags> SnapshotMutex<T> {
 }
 
 impl<T: SnapshotFlags> SnapshotGuard<'_, T> {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "SnapshotGuard"))]
     fn publish(&mut self) {
         if self.dirty {
             let flags = self
@@ -91,17 +97,29 @@ impl<T: SnapshotFlags> SnapshotGuard<'_, T> {
 
 impl<T: SnapshotFlags> Deref for SnapshotGuard<'_, T> {
     type Target = T;
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<SnapshotGuard as Deref>")
+    )]
     fn deref(&self) -> &T {
         self.guard.as_ref().expect("live snapshot guard")
     }
 }
 impl<T: SnapshotFlags> DerefMut for SnapshotGuard<'_, T> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<SnapshotGuard as DerefMut>")
+    )]
     fn deref_mut(&mut self) -> &mut T {
         self.dirty = true;
         self.guard.as_mut().expect("live snapshot guard")
     }
 }
 impl<T: SnapshotFlags> Drop for SnapshotGuard<'_, T> {
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "<SnapshotGuard as Drop>")
+    )]
     fn drop(&mut self) {
         self.publish();
     }
@@ -133,6 +151,39 @@ mod tests {
         drop(guard);
         assert_eq!(state.flags(), 5);
         assert_eq!(state.lock().unwrap().0, 5);
+    }
+
+    #[test]
+    fn notified_wait_observes_other_thread_mutation_and_republishes() {
+        let state = SnapshotMutex::new(State(0));
+        let cv = Condvar::new();
+        let mut guard = state.lock().unwrap();
+        guard.0 = 3;
+
+        std::thread::scope(|scope| {
+            let notifier = scope.spawn(|| {
+                let mut other = state.lock().unwrap();
+                assert_eq!(state.flags(), 3);
+                assert_eq!(other.0, 3);
+                other.0 = 5;
+                drop(other);
+                cv.notify_one();
+            });
+            // Condvar waits may wake spuriously. Check the protected predicate.
+            while guard.0 != 5 {
+                let (next, timeout) = state
+                    .wait_timeout(&cv, guard, Duration::from_secs(5))
+                    .unwrap();
+                guard = next;
+                assert!(guard.0 == 5 || !timeout.timed_out());
+            }
+            notifier.join().unwrap();
+            assert_eq!(state.flags(), 5);
+            guard.0 = 7;
+            drop(guard);
+            assert_eq!(state.flags(), 7);
+            assert_eq!(state.lock().unwrap().0, 7);
+        });
     }
 
     #[test]
