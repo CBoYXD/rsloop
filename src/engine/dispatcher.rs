@@ -341,8 +341,11 @@ impl RuntimeDispatcher {
                 pending_ready,
                 local_mark,
             }) => {
-                self.active_run = Some(ActiveRun { pending_ready });
+                self.active_run = Some(ActiveRun {
+                    pending_ready: Arc::clone(&pending_ready),
+                });
                 self.forward_ready_batch(local_mark);
+                self.core.activate_ready_dispatch(&pending_ready);
             }
             LoopCommand::Run(LoopRunCommand::FinishRun { done_tx }) => {
                 self.finish_run();

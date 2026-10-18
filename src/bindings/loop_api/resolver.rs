@@ -13,6 +13,10 @@ use std::{
     ffi::{CStr, CString, c_char, c_int},
     net::Ipv4Addr,
     ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use pyo3::{
@@ -57,6 +61,22 @@ enum Outcome {
     Gai(i32),
     /// `EAI_SYSTEM` with its `errno`.
     Os(i32),
+}
+
+/// A done callback owns only Rust state, so the future and its queued worker
+/// cannot form a Python reference cycle. Workers can observe cancellation
+/// without acquiring the GIL. An already-running libc lookup cannot be stopped.
+#[pyclass(frozen)]
+struct CancelLookup(Arc<AtomicBool>);
+
+#[pymethods]
+impl CancelLookup {
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "CancelLookup"))]
+    fn __call__(&self, _future: &Bound<'_, PyAny>) {
+        // Any settled future no longer needs its queued lookup, including one
+        // explicitly settled by its caller rather than cancelled.
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// Resolves `request` natively when the loop and the arguments allow it.
@@ -106,8 +126,20 @@ pub(super) fn getaddrinfo<'py>(
         Ok(_) => {
             let core = slf.borrow(py).core.clone();
             let pending = future.clone_ref(py);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            future.call_method1(
+                py,
+                crate::python_names::add_done_callback(py),
+                (Py::new(py, CancelLookup(cancelled.clone()))?,),
+            )?;
             crate::blocking::spawn_bounded(move || {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
                 let outcome = query.resolve();
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
                 let work = LoopWork(Box::new(move |py| complete(py, &pending, outcome)));
                 // A closed loop drops the work; nobody awaits its future any
                 // more.
@@ -167,30 +199,30 @@ fn audit(
 /// namespace, whose code is named `getaddrinfo`, and which wraps nothing.
 #[cfg_attr(feature = "profile", hotpath::measure)]
 fn stdlib_getaddrinfo_in_place(py: Python<'_>) -> PyResult<bool> {
-    static STDLIB: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    // Function identity is mutable instrumentation's stable anchor: replacing
+    // __code__ or adding __wrapped__ leaves the function object unchanged.
+    // Keep the original immutable code object and recheck both on every call.
+    static STDLIB_CODE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     let socket = py.import("socket")?;
     let installed = socket.getattr("getaddrinfo")?;
-    let is_stdlib = STDLIB
-        .get(py)
-        .is_some_and(|stdlib| installed.is(stdlib.bind(py)))
-        || {
-            let is_stdlib = installed
-                .get_type()
-                .is(&py.import("types")?.getattr("FunctionType")?)
-                && installed
-                    .getattr("__globals__")?
-                    .is(&socket.getattr("__dict__")?)
-                && installed
-                    .getattr("__code__")?
-                    .getattr("co_name")?
-                    .eq("getaddrinfo")?
-                && !installed.hasattr("__wrapped__")?;
-            if is_stdlib {
-                // A reloaded module's new function is recognised again above.
-                let _ = STDLIB.set(py, installed.unbind());
-            }
-            is_stdlib
-        };
+    if !installed
+        .get_type()
+        .is(&py.import("types")?.getattr("FunctionType")?)
+        || installed.hasattr("__wrapped__")?
+        || !installed
+            .getattr("__globals__")?
+            .is(&socket.getattr("__dict__")?)
+    {
+        return Ok(false);
+    }
+    let code = installed.getattr("__code__")?;
+    if !code.getattr("co_name")?.eq("getaddrinfo")? {
+        return Ok(false);
+    }
+    let original_code = STDLIB_CODE.get_or_init(py, || code.clone().unbind());
+    // Reloading socket creates an equal immutable code object. Checking its
+    // contents also keeps in-place instrumentation detectable after reload.
+    let is_stdlib = code.is(original_code.bind(py)) || code.eq(original_code.bind(py))?;
     Ok(is_stdlib && builtin_delegate_in_place(py, &socket)?)
 }
 

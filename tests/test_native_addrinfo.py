@@ -311,6 +311,69 @@ def test_a_functools_wraps_wrapper_receives_every_lookup():
     ]
 
 
+@pytest.mark.parametrize("mutation", ["code", "wrapped", "both"])
+@pytest.mark.parametrize("reload_socket", [False, True])
+def test_cached_stdlib_function_respects_in_place_instrumentation(
+    mutation, reload_socket
+):
+    # Instrumentation can preserve the function object and even co_name.
+    # Warm the native cache first, mutate in place, then restore the original.
+    output = _run_script(
+        f"""
+        import asyncio, importlib, socket, sys, threading, types
+        import rsloop
+
+        calls = []
+        native = {{}}
+        loop_thread = threading.get_ident()
+
+        def hook(event, args):
+            if event == "socket.getaddrinfo":
+                native[args[1]] = threading.get_ident() == loop_thread
+
+        sys.addaudithook(hook)
+
+        def lookup(port):
+            async def main():
+                loop = asyncio.get_running_loop()
+                return await loop.getaddrinfo("localhost", port, type=socket.SOCK_STREAM)
+            return rsloop.run(main())
+
+        lookup(1)
+        if {reload_socket!r}:
+            importlib.reload(socket)
+        installed = socket.getaddrinfo
+        original_code = installed.__code__
+        original = types.FunctionType(
+            original_code, installed.__globals__, installed.__name__,
+            installed.__defaults__, installed.__closure__
+        )
+        socket._rsloop_original_lookup = original
+        socket._rsloop_instrumented_calls = calls
+        namespace = {{}}
+        exec("def getaddrinfo(*args, **kwargs):\\n"
+             "    _rsloop_instrumented_calls.append(args[1])\\n"
+             "    return _rsloop_original_lookup(*args, **kwargs)\\n", namespace)
+        if {mutation!r} in ("code", "both"):
+            installed.__code__ = namespace["getaddrinfo"].__code__
+        if {mutation!r} in ("wrapped", "both"):
+            installed.__wrapped__ = original
+        lookup(2)
+        installed.__code__ = original_code
+        if hasattr(installed, "__wrapped__"):
+            del installed.__wrapped__
+        lookup(3)
+        print(calls)
+        print(native)
+        """
+    )
+    expected_calls = "[]" if mutation == "wrapped" else "[2]"
+    assert output.splitlines() == [
+        expected_calls,
+        "{1: True, 2: False, 3: True}",
+    ]
+
+
 @pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="reads thread names in /proc"
 )

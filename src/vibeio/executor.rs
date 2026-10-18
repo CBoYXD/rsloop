@@ -1840,7 +1840,7 @@ mod tests {
             });
         }
         std::thread::spawn(move || {
-            let runtime = Runtime::new(AnyDriver::new_mio().unwrap());
+            let runtime = Runtime::new(AnyDriver::new_best().unwrap());
             for round in 1..=ROUNDS {
                 let (woken, armed, slot) = (woken.clone(), armed.clone(), slot.clone());
                 let mut published = false;

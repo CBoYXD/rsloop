@@ -323,6 +323,7 @@ pub struct FdWatch {
 
 struct ActiveReadyDispatch {
     pending_ready: Arc<Mutex<PendingReady>>,
+    accepting_ready: bool,
 }
 
 /// Mutable lifecycle and Python-facing configuration guarded by `LoopCore`.
@@ -796,6 +797,7 @@ impl LoopCore {
                 .expect("poisoned active ready dispatch");
             *active_dispatch = Some(ActiveReadyDispatch {
                 pending_ready: Arc::clone(&pending_ready),
+                accepting_ready: false,
             });
         }
         self.send_command(LoopCommand::Run(LoopRunCommand::EnterRun {
@@ -1935,6 +1937,9 @@ impl LoopCore {
         let Some(dispatch) = active_dispatch.as_ref() else {
             return Err(item);
         };
+        if !dispatch.accepting_ready {
+            return Err(item);
+        }
 
         let mut pending = dispatch
             .pending_ready
@@ -1945,6 +1950,24 @@ impl LoopCore {
         drop(pending);
         self.wake.signal();
         Ok(())
+    }
+
+    /// Enables direct producers only after the dispatcher has forwarded work
+    /// left over from the previous run. Those items are no longer counted in
+    /// `channel_handles`, but must still precede newly scheduled handles.
+    #[cfg_attr(feature = "profile", hotpath::measure(impl_type = "LoopCore"))]
+    pub(crate) fn activate_ready_dispatch(&self, pending_ready: &Arc<Mutex<PendingReady>>) {
+        let mut active_dispatch = self
+            .active_ready_dispatch
+            .lock()
+            .expect("poisoned active ready dispatch");
+        // The loop may already have stopped on local work while EnterRun was
+        // being processed. Never republish a queue it has retired.
+        if let Some(dispatch) = active_dispatch.as_mut()
+            && Arc::ptr_eq(&dispatch.pending_ready, pending_ready)
+        {
+            dispatch.accepting_ready = true;
+        }
     }
 
     /// Counts items the loop thread queued for itself.
@@ -2024,6 +2047,43 @@ mod wake_tests {
     use futures::task::{ArcWake, noop_waker, waker};
 
     use super::*;
+
+    #[test]
+    fn direct_ready_dispatch_waits_for_previous_run_backlog() {
+        let core = LoopCore::new();
+        let pending_ready = Arc::new(Mutex::new(PendingReady::default()));
+        *core.active_ready_dispatch.lock().unwrap() = Some(ActiveReadyDispatch {
+            pending_ready: Arc::clone(&pending_ready),
+            accepting_ready: false,
+        });
+
+        // `run_forever` has published its queue, but EnterRun has not yet
+        // forwarded the previous run's unexecuted callbacks. New producers
+        // must stay on the command channel during that interval.
+        assert!(core.try_enqueue_active_ready(ReadyItem::Stop).is_err());
+        assert!(pending_ready.lock().unwrap().items.is_empty());
+        pending_ready.lock().unwrap().push(ReadyItem::Stop, 0);
+        core.activate_ready_dispatch(&pending_ready);
+        assert!(core.try_enqueue_active_ready(ReadyItem::Stop).is_ok());
+        assert_eq!(pending_ready.lock().unwrap().items.len(), 2);
+
+        // A delayed EnterRun must not resurrect a queue the loop has retired.
+        core.active_ready_dispatch.lock().unwrap().take();
+        core.activate_ready_dispatch(&pending_ready);
+        assert!(core.try_enqueue_active_ready(ReadyItem::Stop).is_err());
+
+        let next_pending = Arc::new(Mutex::new(PendingReady::default()));
+        *core.active_ready_dispatch.lock().unwrap() = Some(ActiveReadyDispatch {
+            pending_ready: Arc::clone(&next_pending),
+            accepting_ready: false,
+        });
+        core.activate_ready_dispatch(&pending_ready);
+        assert!(core.try_enqueue_active_ready(ReadyItem::Stop).is_err());
+        core.activate_ready_dispatch(&next_pending);
+        assert!(core.try_enqueue_active_ready(ReadyItem::Stop).is_ok());
+        core.active_ready_dispatch.lock().unwrap().take();
+        core.close().unwrap();
+    }
 
     #[test]
     fn timer_timestamp_matches_the_heap_deadline() {
