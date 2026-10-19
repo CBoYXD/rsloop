@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
-use pyo3::{exceptions::PyRuntimeError, prelude::*};
+use pyo3::prelude::*;
 
-use super::{PendingProcessEvent, ProcessTransportCore, PyProcessTransport};
+use super::{PendingProcessEvent, ProcessState, ProcessTransportCore, PyProcessTransport};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessExitDecision {
@@ -134,7 +134,7 @@ impl ProcessTransportCore {
         fd: i32,
         exc: Option<String>,
     ) -> PyResult<()> {
-        let (exc, should_finish, pending_exit_code) = {
+        let pending_exit_code = {
             let mut state = self.state.lock().expect("poisoned process state");
             if !state.open_pipes.remove(&fd) {
                 return Ok(());
@@ -146,36 +146,20 @@ impl ProcessTransportCore {
             } else {
                 None
             };
-            (exc, should_finish, pending_exit_code)
-        };
-
-        if !self.loop_core.on_runtime_thread() {
+            // Publish the event while still holding the lifecycle lock. A
+            // second reader must not observe the last pipe as closed and
+            // enqueue ConnectionLost ahead of this pipe's EOF notification.
+            // Loop-thread stdin callbacks use the same queue too: delivering
+            // them inline could overtake an already queued stdout/stderr EOF.
             self.enqueue_pending_event(PendingProcessEvent::PipeConnectionLost { fd, exc });
-            if let Some(code) = pending_exit_code {
-                self.process_exited(code)?;
-            } else if should_finish {
-                self.enqueue_pending_event(PendingProcessEvent::ConnectionLost { exc: None });
+            if should_finish {
+                self.enqueue_connection_lost_locked(&mut state, None);
             }
-            return Ok(());
-        }
-
-        if let Err(err) = self.call_in_loop_context(|py| {
-            self.pipe_connection_lost_value_with_py(
-                py,
-                fd,
-                exc.clone().map(PyRuntimeError::new_err),
-            )
-        }) {
-            self.report_error(err, "subprocess pipe_connection_lost failed");
-            return Err(PyRuntimeError::new_err(
-                "subprocess pipe_connection_lost failed",
-            ));
-        }
+            pending_exit_code
+        };
 
         if let Some(code) = pending_exit_code {
             self.process_exited(code)?;
-        } else if should_finish {
-            self.connection_lost_message(None)?;
         }
         Ok(())
     }
@@ -208,7 +192,7 @@ impl ProcessTransportCore {
         hotpath::measure(impl_type = "ProcessTransportCore")
     )]
     pub(super) fn process_exited(self: &Arc<Self>, returncode: i32) -> PyResult<()> {
-        let should_finish = {
+        {
             let mut state = self.state.lock().expect("poisoned process state");
             let open_pipes_empty = state.open_pipes.is_empty();
             let mut exited = state.exited;
@@ -221,26 +205,18 @@ impl ProcessTransportCore {
             );
             state.exited = exited;
             state.returncode = stored_returncode;
-            match decision {
+            let should_finish = match decision {
                 ProcessExitDecision::Duplicate => return Ok(()),
                 ProcessExitDecision::First { should_finish } => should_finish,
-            }
-        };
-        self.exit_notify.notify_all();
-
-        if !self.loop_core.on_runtime_thread() {
+            };
+            // Keep state publication and FIFO publication indivisible, just
+            // like pipe closure. The last reader can finish concurrently.
             self.enqueue_pending_event(PendingProcessEvent::ProcessExited { returncode });
             if should_finish {
-                self.enqueue_pending_event(PendingProcessEvent::ConnectionLost { exc: None });
+                self.enqueue_connection_lost_locked(&mut state, None);
             }
-            return Ok(());
         }
-
-        self.call_in_loop_context(|py| self.process_exited_with_py(py, returncode))?;
-
-        if should_finish {
-            self.connection_lost_message(None)?;
-        }
+        self.exit_notify.notify_all();
         Ok(())
     }
 
@@ -276,24 +252,27 @@ impl ProcessTransportCore {
         feature = "profile",
         hotpath::measure(impl_type = "ProcessTransportCore")
     )]
+    fn enqueue_connection_lost_locked(
+        self: &Arc<Self>,
+        state: &mut ProcessState,
+        exc: Option<String>,
+    ) {
+        if state.connection_lost_called {
+            return;
+        }
+        state.connection_lost_called = true;
+        state.closing = true;
+        self.enqueue_pending_event(PendingProcessEvent::ConnectionLost { exc });
+    }
+
+    #[cfg_attr(
+        feature = "profile",
+        hotpath::measure(impl_type = "ProcessTransportCore")
+    )]
     pub(super) fn connection_lost_message(self: &Arc<Self>, exc: Option<String>) -> PyResult<()> {
-        {
-            let mut state = self.state.lock().expect("poisoned process state");
-            if state.connection_lost_called {
-                return Ok(());
-            }
-            state.connection_lost_called = true;
-            state.closing = true;
-        }
-
-        if !self.loop_core.on_runtime_thread() {
-            self.enqueue_pending_event(PendingProcessEvent::ConnectionLost { exc });
-            return Ok(());
-        }
-
-        self.call_in_loop_context(|py| {
-            self.connection_lost_with_py(py, exc.clone().map(PyRuntimeError::new_err))
-        })
+        let mut state = self.state.lock().expect("poisoned process state");
+        self.enqueue_connection_lost_locked(&mut state, exc);
+        Ok(())
     }
 
     #[cfg_attr(
@@ -386,7 +365,89 @@ mod verification {
 
 #[cfg(test)]
 mod lifecycle_tests {
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
+    };
+
+    use pyo3::{prelude::*, types::PyModule};
+
     use super::{ProcessExitDecision, process_connection_lost_eligible, record_process_exit};
+    use crate::{
+        async_event::AsyncEvent,
+        engine::LoopCore,
+        transport::process::{ProcessState, ProcessTransportCore},
+    };
+
+    #[test]
+    fn loop_thread_process_exit_cannot_overtake_queued_pipe_loss() {
+        crate::initialize_python_for_tests();
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c"class Protocol:\n    def __init__(self): self.events = []\n    def pipe_connection_lost(self, fd, exc): self.events.append(fd)\n    def process_exited(self): self.events.append('exited')\n    def connection_lost(self, exc): self.events.append('lost')\n",
+                c"test_process_events.py",
+                c"test_process_events",
+            )
+            .unwrap();
+            let protocol = module
+                .getattr("Protocol")
+                .unwrap()
+                .call0()
+                .unwrap()
+                .unbind();
+            let loop_core = LoopCore::new();
+            let (control_tx, _control_rx) = mpsc::channel();
+            let core = Arc::new(ProcessTransportCore {
+                loop_core: Arc::clone(&loop_core),
+                loop_obj: py.None(),
+                state: Mutex::new(ProcessState {
+                    protocol: protocol.clone_ref(py),
+                    context: py.None(),
+                    context_needs_run: false,
+                    pid: 0,
+                    returncode: None,
+                    closing: false,
+                    exited: false,
+                    pending_exit_code: Some(0),
+                    connection_lost_called: false,
+                    open_pipes: HashSet::from([0, 2]),
+                    pipe_transports: HashMap::new(),
+                }),
+                text_config: None,
+                control_tx,
+                exit_notify: AsyncEvent::new(),
+                pending_events: Mutex::new(VecDeque::new()),
+                events_scheduled: AtomicBool::new(false),
+            });
+
+            // A reader thread has queued stderr EOF, but the loop has not
+            // drained it when the stdin writer's connection_lost runs.
+            core.pipe_connection_lost_message(2, None).unwrap();
+            loop_core.mark_runtime_thread();
+            core.pipe_connection_lost_message(0, None).unwrap();
+            let before_drain = protocol
+                .getattr(py, "events")
+                .unwrap()
+                .bind(py)
+                .len()
+                .unwrap();
+            core.drain_pending_events_with_py(py).unwrap();
+            let events = protocol
+                .getattr(py, "events")
+                .unwrap()
+                .bind(py)
+                .repr()
+                .unwrap()
+                .to_string();
+
+            loop_core.clear_runtime_thread();
+            drop(core);
+            loop_core.close().unwrap();
+            assert_eq!(before_drain, 0, "lifecycle callbacks must share one FIFO");
+            assert_eq!(events, "[2, 0, 'exited', 'lost']");
+        });
+    }
 
     #[test]
     fn duplicate_process_exit_keeps_the_first_returncode() {
