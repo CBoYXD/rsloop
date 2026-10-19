@@ -517,15 +517,16 @@ def performance_decision(
     if any(value["ci_pct"][0] > regression_budget for value in estimates.values()):
         return "reject_regression"
     if any(
-        value["ci_pct"][0] > rss_regression_budget
-        for value in rss_estimates.values()
+        value["ci_pct"][0] > rss_regression_budget for value in rss_estimates.values()
     ):
         return "reject_rss_regression"
-    if estimates[primary]["ci_pct"][1] < -minimum_gain and all(
-        value["ci_pct"][1] <= regression_budget for value in estimates.values()
-    ) and all(
-        value["ci_pct"][1] <= rss_regression_budget
-        for value in rss_estimates.values()
+    if (
+        estimates[primary]["ci_pct"][1] < -minimum_gain
+        and all(value["ci_pct"][1] <= regression_budget for value in estimates.values())
+        and all(
+            value["ci_pct"][1] <= rss_regression_budget
+            for value in rss_estimates.values()
+        )
     ):
         return "balanced_gate_passed"
     return "inconclusive"
@@ -656,8 +657,7 @@ def compare(args) -> None:
         )
         rss_values = {
             label: [
-                p["samples"][label]["result"]["peak_rss_bytes"]
-                for p in pairs[name]
+                p["samples"][label]["result"]["peak_rss_bytes"] for p in pairs[name]
             ]
             for label in ("baseline", "candidate")
         }

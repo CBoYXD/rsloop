@@ -202,6 +202,7 @@ import asyncio
 import gc
 import statistics
 import sys
+
 sys.path.insert(0, "benches")
 from compare_event_loops import loop_factory_for
 from connection_churn import measure

@@ -69,9 +69,7 @@ def main():
             print(f"Completed paired block {block + 1}/{args.blocks}", flush=True)
     if hashes != {name: sha256(path) for name, path in binaries.items()}:
         raise ValueError("Benchmark binaries changed during measurement")
-    report = paired_estimate(
-        values["baseline"], values["candidate"], seed=args.seed
-    )
+    report = paired_estimate(values["baseline"], values["candidate"], seed=args.seed)
     report["min_observed_seconds"] = min(values["baseline"] + values["candidate"])
     reliable = args.blocks >= 12 and report["min_observed_seconds"] >= 0.25
     report["decision"] = (

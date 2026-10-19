@@ -78,12 +78,16 @@ async def __open_connection(host=None, port=None, *, limit=2**16, **kwargs):
     return await __ORIG_OPEN_CONNECTION(host, port, limit=limit, **kwargs)
 
 
-async def __start_server(client_connected_cb, host=None, port=None, *, limit=2**16, **kwargs):
+async def __start_server(
+    client_connected_cb, host=None, port=None, *, limit=2**16, **kwargs
+):
     if isinstance(__asyncio.get_running_loop(), Loop):
         return await __native_start_server(
             client_connected_cb, host, port, limit=limit, **kwargs
         )
-    return await __ORIG_START_SERVER(client_connected_cb, host, port, limit=limit, **kwargs)
+    return await __ORIG_START_SERVER(
+        client_connected_cb, host, port, limit=limit, **kwargs
+    )
 
 
 if __asyncio.open_connection is __ORIG_OPEN_CONNECTION:

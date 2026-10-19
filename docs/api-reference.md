@@ -95,8 +95,12 @@ initialize a runtime, probe the OS, or report another loop's driver.
 ```python
 loop = rsloop.new_event_loop()
 print(loop.runtime_info())  # {"reactor": None}
+
+
 async def inspect_runtime():
     print(loop.runtime_info())  # e.g. {"reactor": "mio"} on Linux fallback
+
+
 try:
     loop.run_until_complete(inspect_runtime())
 finally:

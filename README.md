@@ -100,6 +100,7 @@ Install as the default asyncio event loop policy:
 import asyncio
 import rsloop
 
+
 async def main() -> None:
     print("hello from rsloop")
 

@@ -68,7 +68,9 @@ def test_invalid_samples_are_rejected(baseline, candidate):
         ((-4, -2), (-1, 2), (-2, 2), False, "insufficient_measurement"),
     ],
 )
-def test_gate_requires_gain_and_bounded_regression(primary, guard, rss, reliable, expected):
+def test_gate_requires_gain_and_bounded_regression(
+    primary, guard, rss, reliable, expected
+):
     estimates = {"tcp": {"ci_pct": primary}, "tasks": {"ci_pct": guard}}
     assert (
         lab.performance_decision(
