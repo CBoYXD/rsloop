@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict
 
 import rsloop
-from litestar import Litestar
-from litestar import get
-
 from _smoke import run_uvicorn_app
+from litestar import Litestar, get
 
 
 @get("/")
-async def index() -> Dict[str, str]:
+async def index() -> dict[str, str]:
     loop = asyncio.get_running_loop()
     return {
         "ok": "litestar-rsloop",

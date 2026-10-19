@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 
 import rsloop
+from _smoke import run_uvicorn_app
 from django.conf import settings
 from django.http import JsonResponse
 from django.urls import path
-
-from _smoke import run_uvicorn_app
 
 
 async def index(request: object) -> JsonResponse:

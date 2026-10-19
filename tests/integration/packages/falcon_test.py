@@ -5,7 +5,6 @@ from typing import Any
 
 import falcon.asgi
 import rsloop
-
 from _smoke import run_uvicorn_app
 
 

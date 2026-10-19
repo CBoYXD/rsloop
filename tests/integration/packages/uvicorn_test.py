@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import rsloop
-
 from _smoke import run_uvicorn_app
 
 

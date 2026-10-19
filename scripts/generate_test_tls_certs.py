@@ -7,7 +7,6 @@ import subprocess
 import sys
 import textwrap
 
-
 CA_CONFIG = """
 [req]
 distinguished_name = dn

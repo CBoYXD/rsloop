@@ -11,7 +11,6 @@ import rsloop
 from sanic import Sanic
 from sanic.response import json
 
-
 app = Sanic("rsloop_sanic_smoke")
 
 

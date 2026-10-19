@@ -823,7 +823,6 @@ class TestCompatibility:
 
             def capture_warning(message, category=None, stacklevel=1, source=None):
                 messages.append(str(message))
-                return None
 
             with monkeypatch.context() as patch:
                 patch.setattr(warnings, "warn", capture_warning)
@@ -941,7 +940,6 @@ class TestCompatibility:
             def capture_warning(message, category=None, stacklevel=1, source=None):
                 messages.append(str(message))
                 sources.append(source)
-                return None
 
             with monkeypatch.context() as patch:
                 patch.setattr(warnings, "warn", capture_warning)

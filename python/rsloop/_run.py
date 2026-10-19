@@ -11,7 +11,7 @@ from ._loop_compat import Loop
 from ._loop_compat import cancel_all_tasks as __cancel_all_tasks
 
 _T = __typing.TypeVar("_T")
-_PREVIOUS_EVENT_LOOP_POLICY: __typing.Optional[__asyncio.AbstractEventLoopPolicy] = None
+_PREVIOUS_EVENT_LOOP_POLICY: __asyncio.AbstractEventLoopPolicy | None = None
 
 
 def _noop() -> None:
@@ -29,7 +29,7 @@ def _get_event_loop_policy() -> __asyncio.AbstractEventLoopPolicy:
 
 
 def _set_event_loop_policy(
-    policy: __typing.Optional[__asyncio.AbstractEventLoopPolicy],
+    policy: __asyncio.AbstractEventLoopPolicy | None,
 ) -> None:
     with __warnings.catch_warnings():
         __warnings.filterwarnings(
@@ -93,7 +93,7 @@ class _SigintHandler:
     def __call__(
         self,
         signum: int,
-        frame: __typing.Optional[__typing.Any],
+        frame: __typing.Any | None,
     ) -> None:
         self.interrupt_count += 1
         if self.interrupt_count == 1 and not self._main_task.done():

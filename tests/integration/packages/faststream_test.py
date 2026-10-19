@@ -4,7 +4,6 @@ import rsloop
 from faststream import FastStream, TestApp
 from faststream.nats import NatsBroker, TestNatsBroker
 
-
 broker = NatsBroker()
 app = FastStream(broker)
 received: list[str] = []
@@ -17,9 +16,8 @@ async def handle(message: str) -> str:
 
 
 async def main() -> None:
-    async with TestNatsBroker(broker, connect_only=True):
-        async with TestApp(app):
-            response = await broker.request("hello", "rsloop.in")
+    async with TestNatsBroker(broker, connect_only=True), TestApp(app):
+        response = await broker.request("hello", "rsloop.in")
 
     assert response.body == b"echo:hello", response.body
     assert received == ["hello"], received

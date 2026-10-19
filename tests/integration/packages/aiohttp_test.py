@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import asyncio
 
-from aiohttp import ClientSession
-from aiohttp import web
 import rsloop
-
 from _smoke import reserve_port
+from aiohttp import ClientSession, web
 
 
 async def index(request: web.Request) -> web.Response:
