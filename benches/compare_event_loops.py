@@ -211,7 +211,7 @@ def loop_factory_for(loop_name: str) -> Callable[[], asyncio.AbstractEventLoop]:
 def is_loop_available(loop_name: str) -> tuple[bool, str | None]:
     try:
         loop_factory_for(loop_name)
-    except Exception as exc:  # pragma: no cover - exercised in real env
+    except Exception as exc:  # noqa: BLE001 - report optional loop initialization failures
         return False, f"{type(exc).__name__}: {exc}"
     return True, None
 
@@ -404,7 +404,7 @@ async def maybe_wait_closed(writer: asyncio.StreamWriter) -> None:
         return
     try:
         await wait_closed()
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort cleanup across loop implementations
         return
 
 

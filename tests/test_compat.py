@@ -968,7 +968,7 @@ class TestCompatibility:
                     future = __import__("concurrent.futures").futures.Future()
                     try:
                         future.set_result(func(*args))
-                    except BaseException as exc:
+                    except BaseException as exc:  # noqa: BLE001 - mirror Executor.submit
                         future.set_exception(exc)
                     return future
 
@@ -1295,7 +1295,7 @@ class TestCompatibility:
                     port,
                 )
                 try:
-                    with open(path, "rb") as f:
+                    with open(path, "rb") as f:  # noqa: ASYNC230 - local sendfile fixture
                         sent = await loop.sendfile(transport, f)
                     transport.close()
                     received = await asyncio.wait_for(done, 1.0)
@@ -1406,7 +1406,7 @@ class TestCompatibility:
                 sock.setblocking(False)
                 await loop.sock_connect(sock, ("127.0.0.1", port))
                 try:
-                    with open(path, "rb") as f:
+                    with open(path, "rb") as f:  # noqa: ASYNC230 - local sendfile fixture
                         sent = await loop.sock_sendfile(sock, f)
                     received = await asyncio.wait_for(recv_done, 1.0)
                     await asyncio.wait_for(server_done, 1.0)
@@ -1460,7 +1460,7 @@ class TestCompatibility:
             def worker():
                 try:
                     loop.add_signal_handler(cast(Any, signal).SIGUSR1, lambda: None)
-                except BaseException as exc:
+                except BaseException as exc:  # noqa: BLE001 - inspect errors in main thread
                     errors.append(exc)
 
             thread = threading.Thread(target=worker, daemon=True)

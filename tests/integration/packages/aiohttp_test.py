@@ -28,9 +28,11 @@ async def main() -> None:
         site = web.TCPSite(runner, "127.0.0.1", port)
         await site.start()
 
-        async with ClientSession() as session:
-            async with session.get(f"http://127.0.0.1:{port}/") as response:
-                body = await response.text()
+        async with (
+            ClientSession() as session,
+            session.get(f"http://127.0.0.1:{port}/") as response,
+        ):
+            body = await response.text()
 
         assert "aiohttp-rsloop" in body, body
         assert "rsloop" in body, body

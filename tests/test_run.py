@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import gc
 import os
 import shlex
@@ -326,6 +327,7 @@ else:
 """
         proc = subprocess.run(
             [sys.executable, "-c", script],
+            check=False,
             text=True,
             capture_output=True,
             timeout=5,
@@ -357,16 +359,21 @@ else:
                     closed = loop.create_future()
 
                     class ClientProtocol(asyncio.Protocol):
+                        def __init__(self, closed: asyncio.Future[None]) -> None:
+                            self.closed = closed
+
                         def connection_made(
                             self, transport: asyncio.BaseTransport
                         ) -> None:
                             transport.close()
 
                         def connection_lost(self, exc: Exception | None) -> None:
-                            if not closed.done():
-                                closed.set_result(None)
+                            if not self.closed.done():
+                                self.closed.set_result(None)
 
-                    await loop.create_connection(ClientProtocol, "127.0.0.1", port)
+                    await loop.create_connection(
+                        functools.partial(ClientProtocol, closed), "127.0.0.1", port
+                    )
                     await asyncio.wait_for(closed, 1.0)
                     await asyncio.sleep(0)
             finally:
@@ -544,9 +551,11 @@ else:
                 program = sys.executable
                 args = (
                     "-c",
-                    "import sys; data = sys.stdin.buffer.read(); "
-                    "sys.stdout.buffer.write(data.upper()); "
-                    "sys.stderr.write('stderr-ok')",
+                    (
+                        "import sys; data = sys.stdin.buffer.read(); "
+                        "sys.stdout.buffer.write(data.upper()); "
+                        "sys.stderr.write('stderr-ok')"
+                    ),
                 )
             else:
                 program = "/bin/sh"

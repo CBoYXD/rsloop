@@ -66,7 +66,8 @@ async def parent_main() -> None:
     port = reserve_port()
     env = os.environ.copy()
     env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
-    proc = subprocess.Popen(
+    proc = await asyncio.to_thread(
+        subprocess.Popen,
         [sys.executable, __file__, "--serve", str(port)],
         env=env,
         stdout=subprocess.PIPE,
@@ -81,10 +82,10 @@ async def parent_main() -> None:
     finally:
         proc.terminate()
         try:
-            proc.communicate(timeout=5)
+            await asyncio.to_thread(proc.communicate, timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.communicate(timeout=5)
+            await asyncio.to_thread(proc.communicate, timeout=5)
 
 
 def serve(port: int) -> None:

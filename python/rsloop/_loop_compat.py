@@ -9,14 +9,12 @@ import sys as __sys
 import typing as __typing
 
 from ._loop import PyLoop as Loop
-from ._loop import __version__ as __version__
-from ._loop import build_info as build_info
+from ._loop import __version__, build_info, reset_transport_stats, transport_stats
 from ._loop import open_connection as __native_open_connection
-from ._loop import reset_transport_stats as reset_transport_stats
 from ._loop import start_server as __native_start_server
-from ._loop import transport_stats as transport_stats
 
-_T = __typing.TypeVar("_T")
+__all__ = ["Loop", "__version__", "build_info", "reset_transport_stats", "transport_stats"]
+
 __ORIG_SET_EVENT_LOOP = __asyncio.set_event_loop
 
 
@@ -35,14 +33,14 @@ def __set_event_loop(loop: Loop | None) -> None:
         if loop is None or not isinstance(loop, Loop):
             raise
 
-    # asyncio policies accept only stdlib event-loop instances. Maintain the
-    # policy's bookkeeping so get_event_loop() returns the active rsloop.
-    policy = __get_event_loop_policy()
-    local = getattr(policy, "_local", None)
-    if local is None:
-        raise
-    local._set_called = True
-    local._loop = loop
+        # asyncio policies accept only stdlib event-loop instances. Maintain the
+        # policy's bookkeeping so get_event_loop() returns the active rsloop.
+        policy = __get_event_loop_policy()
+        local = getattr(policy, "_local", None)
+        if local is None:
+            raise
+        local._set_called = True
+        local._loop = loop
 
 
 if __asyncio.set_event_loop is __ORIG_SET_EVENT_LOOP:
